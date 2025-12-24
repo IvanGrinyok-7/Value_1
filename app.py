@@ -533,7 +533,7 @@ def build_commentary_and_score(row, cop_ring, cop_tour, trf_ring, trf_tour, cove
 # UI
 # ---------------------------
 st.set_page_config(page_title="PPPoker Anti-Fraud (Type-aware)", layout="wide")
-st.title("PPPoker: проверка риска вывода (RING vs TOURNAMENT)")
+st.title("PPPoker: проверка риска вывода клуба Value")
 
 with st.sidebar:
     st.header("Загрузка файлов")
