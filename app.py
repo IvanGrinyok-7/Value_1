@@ -537,8 +537,8 @@ st.title("PPPoker: проверка риска вывода клуба Value")
 
 with st.sidebar:
     st.header("Загрузка файлов")
-    summary_file = st.file_uploader("Общая таблица (.xlsx) — без шапки", type=["xlsx"])
-    games_file = st.file_uploader("Игры (.csv/.txt) — выгрузка PPPoker", type=["csv", "txt"])
+    summary_file = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker", type=["xlsx"])
+    games_file = st.file_uploader("Игры (.csv/.txt) — выгрузка PPPoker", type=["csv"])
     show_debug = st.checkbox("Показать технические детали", value=False)
 
 st.divider()
