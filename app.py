@@ -533,12 +533,12 @@ def build_commentary_and_score(row, cop_ring, cop_tour, trf_ring, trf_tour, cove
 # UI
 # ---------------------------
 st.set_page_config(page_title="PPPoker Anti-Fraud (Type-aware)", layout="wide")
-st.title("PPPoker: проверка риска вывода клуба Value")
+st.title("PPPoker: проверка риска вывода (RING vs TOURNAMENT)")
 
 with st.sidebar:
     st.header("Загрузка файлов")
-    summary_file = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker", type=["xlsx"])
-    games_file = st.file_uploader("Игры (.csv/.txt) — выгрузка PPPoker", type=["csv"])
+    summary_file = st.file_uploader("Общая таблица (.xlsx) — без шапки", type=["xlsx"])
+    games_file = st.file_uploader("Игры (.csv/.txt) — выгрузка PPPoker", type=["csv", "txt"])
     show_debug = st.checkbox("Показать технические детали", value=False)
 
 st.divider()
