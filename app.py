@@ -36,7 +36,7 @@ COPLAY_TOP2_SHARE_SUSP = 0.75
 # Summary table (Excel)
 # ---------------------------
 def read_summary_excel(uploaded_xlsx) -> pd.DataFrame:
-    # You remove header before upload -> read as raw grid
+    # Ты удаляешь шапку -> читаем как "сырой" грид
     return pd.read_excel(uploaded_xlsx, engine="openpyxl", header=None)
 
 
@@ -48,46 +48,61 @@ def to_float_series(s: pd.Series) -> pd.Series:
 
 
 # ---------------------------
-# Games log -> co-play
+# Games CSV -> co-play
 # ---------------------------
-# More tolerant: catches "ID 251217011516-834882"
-SESSION_ID_RE = re.compile(r"\bID\s+(\d{6,}-\d{3,})\b")
-DIGITS_RE = re.compile(r"\b(\d{6,10})\b")
+# Пример из твоего файла:
+# "2025/12/17\nUTC +0500";ID игры: 251216053643-795459   Название стола: ...
+# ;ID игрока;Ник;...
+# ;11637827;Masalay;...
+GAME_ID_RE = re.compile(r"ID игры:\s*([0-9\-]+)", re.IGNORECASE)
+# строка игрока начинается с ';<digits>;' или '"...";;<digits>;'
+PLAYER_ID_IN_ROW_RE = re.compile(r"(?:^|;)\s*(\d{6,10})\s*;", re.IGNORECASE)
 
 
 def build_coplay_from_games(uploaded_file, known_player_ids: set[int]) -> pd.DataFrame:
-    # file_uploader can give bytes; decode safely
     raw = uploaded_file.getvalue()
     if isinstance(raw, bytes):
         text = raw.decode("utf-8", errors="ignore")
     else:
         text = str(raw)
 
-    matches = list(SESSION_ID_RE.finditer(text))
+    lines = text.splitlines()
+
     sessions = []
+    current_game_id = None
+    current_players = set()
 
-    for i, m in enumerate(matches):
-        sid = m.group(1)
-        start = m.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        block = text[start:end]
+    def flush():
+        nonlocal current_game_id, current_players, sessions
+        if current_game_id and len(current_players) >= 2:
+            sessions.append(
+                {"session_id": current_game_id, "players": sorted(current_players)}
+            )
+        current_game_id = None
+        current_players = set()
 
-        ids = []
-        for tok in DIGITS_RE.findall(block):
-            v = int(tok)
-            if v in known_player_ids:
-                ids.append(v)
+    for line in lines:
+        # 1) новый блок игры
+        m_game = GAME_ID_RE.search(line)
+        if m_game:
+            flush()
+            current_game_id = m_game.group(1).strip()
+            continue
 
-        players = sorted(set(ids))
-        if len(players) >= 2:
-            sessions.append({"session_id": sid, "players": players})
+        # 2) строки игроков внутри блока
+        if current_game_id:
+            m_pid = PLAYER_ID_IN_ROW_RE.search(line)
+            if m_pid:
+                pid = int(m_pid.group(1))
+                # фильтруем по тем ID, которые реально есть в Excel
+                if pid in known_player_ids:
+                    current_players.add(pid)
+
+    flush()
 
     out = pd.DataFrame(sessions)
-
-    # IMPORTANT: even if empty, keep expected columns to avoid KeyError
     if out.empty:
         out = pd.DataFrame(columns=["session_id", "players"])
-
     return out
 
 
@@ -207,12 +222,12 @@ def score_player(net_total, net_ring, net_mtt, comm, cop: dict):
 # UI
 # ---------------------------
 st.set_page_config(page_title="PPPoker Risk Checker (Excel)", layout="wide")
-st.title("PPPoker: авто-оценка риска вывода (Excel-вход)")
+st.title("PPPoker: авто-оценка риска вывода (Excel + Games CSV)")
 
 with st.sidebar:
     st.header("Загрузка файлов")
     summary_file = st.file_uploader("Общая таблица (.xlsx)", type=["xlsx"])
-    games_file = st.file_uploader("Игры/сессии (выгрузка)", type=["csv", "txt"])
+    games_file = st.file_uploader("Игры/сессии (CSV из PPPoker)", type=["csv", "txt"])
 
 st.divider()
 
@@ -250,11 +265,7 @@ with col2:
     st.write(f"Игроков в Excel: {len(df)}")
     st.write(f"Сессий (из games): {len(sessions_df)}")
     st.write("sessions_df columns:", list(sessions_df.columns))
-
-    st.caption(
-        "Если сессий = 0 — значит парсер не нашёл блоки 'ID ...' или ID игроков в games не совпали с Excel. "
-        "В этом случае пришли сюда 30-50 строк из начала файла 'игры'."
-    )
+    st.caption("Если сессий = 0 — значит в файле 'Игры' не нашли строки 'ID игры:' или строки игроков ';ID игрока;...'.")
 
 if not run:
     st.stop()
