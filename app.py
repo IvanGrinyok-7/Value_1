@@ -1,6 +1,4 @@
 import re
-from io import StringIO
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -16,11 +14,14 @@ def col_idx(col_letter: str) -> int:
         n = n * 26 + (ord(ch) - ord("A") + 1)
     return n - 1
 
-IDX_ID = col_idx("A")      # A
-IDX_NET_TOTAL = col_idx("I")  # I
-IDX_NET_RING = col_idx("O")   # O
-IDX_NET_MTT = col_idx("P")    # P (MTT/SNG)
-IDX_COMM = col_idx("AB")      # AB
+
+# Excel columns from your "общая таблица"
+IDX_ID = col_idx("A")         # A - ID
+IDX_NET_TOTAL = col_idx("I")  # I - общий выигрыш
+IDX_NET_RING = col_idx("O")   # O - Ring Game
+IDX_NET_MTT = col_idx("P")    # P - MTT/SNG
+IDX_COMM = col_idx("AB")      # AB - комиссия
+
 
 # thresholds (tune later)
 T_APPROVE = 25
@@ -32,31 +33,39 @@ COPLAY_TOP2_SHARE_SUSP = 0.75
 
 
 # ---------------------------
-# Parsing: summary table (Excel)
+# Summary table (Excel)
 # ---------------------------
 def read_summary_excel(uploaded_xlsx) -> pd.DataFrame:
-    # Read first sheet by default
-    df = pd.read_excel(uploaded_xlsx, engine="openpyxl", header=None)
-    return df
+    # You remove header before upload -> read as raw grid
+    return pd.read_excel(uploaded_xlsx, engine="openpyxl", header=None)
+
 
 def to_float_series(s: pd.Series) -> pd.Series:
     x = s.fillna("").astype(str).str.replace("\u00a0", "", regex=False).str.strip()
     x = x.str.replace(",", ".", regex=False)
-    x = x.replace({"": np.nan, "None": np.nan})
+    x = x.replace({"": np.nan, "None": np.nan, "nan": np.nan})
     return pd.to_numeric(x, errors="coerce")
 
 
 # ---------------------------
-# Parsing: games log -> co-play
+# Games log -> co-play
 # ---------------------------
-SESSION_ID_RE = re.compile(r"\bID\s*(\d{12,}-\d+)\b")
+# More tolerant: catches "ID 251217011516-834882"
+SESSION_ID_RE = re.compile(r"\bID\s+(\d{6,}-\d{3,})\b")
 DIGITS_RE = re.compile(r"\b(\d{6,10})\b")
 
+
 def build_coplay_from_games(uploaded_file, known_player_ids: set[int]) -> pd.DataFrame:
-    text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+    # file_uploader can give bytes; decode safely
+    raw = uploaded_file.getvalue()
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", errors="ignore")
+    else:
+        text = str(raw)
 
     matches = list(SESSION_ID_RE.finditer(text))
     sessions = []
+
     for i, m in enumerate(matches):
         sid = m.group(1)
         start = m.start()
@@ -73,11 +82,28 @@ def build_coplay_from_games(uploaded_file, known_player_ids: set[int]) -> pd.Dat
         if len(players) >= 2:
             sessions.append({"session_id": sid, "players": players})
 
-    return pd.DataFrame(sessions)
+    out = pd.DataFrame(sessions)
+
+    # IMPORTANT: even if empty, keep expected columns to avoid KeyError
+    if out.empty:
+        out = pd.DataFrame(columns=["session_id", "players"])
+
+    return out
+
 
 def coplay_features(target_id: int, sessions_df: pd.DataFrame) -> dict:
+    if sessions_df.empty or "players" not in sessions_df.columns:
+        return {
+            "sessions_count": 0,
+            "unique_opponents": 0,
+            "top1_coplay_share": 0.0,
+            "top2_coplay_share": 0.0,
+            "top_partners": [],
+        }
+
     rows = sessions_df[sessions_df["players"].apply(lambda ps: target_id in ps)]
     sessions_count = int(len(rows))
+
     if sessions_count == 0:
         return {
             "sessions_count": 0,
@@ -99,6 +125,7 @@ def coplay_features(target_id: int, sessions_df: pd.DataFrame) -> dict:
 
     top1 = partners[0][1] if len(partners) >= 1 else 0
     top2 = partners[1][1] if len(partners) >= 2 else 0
+
     top1_share = top1 / sessions_count if sessions_count else 0.0
     top2_share = (top1 + top2) / sessions_count if sessions_count else 0.0
 
@@ -121,6 +148,7 @@ def risk_decision(score: int) -> str:
         return "FAST_CHECK"
     return "MANUAL_REVIEW"
 
+
 def score_player(net_total, net_ring, net_mtt, comm, cop: dict):
     reasons = []
     score = 0
@@ -138,15 +166,15 @@ def score_player(net_total, net_ring, net_mtt, comm, cop: dict):
         score += 10
 
     # MTT reduces suspicion if profit mainly via MTT
-    if pd.notna(net_total) and net_total > 0 and pd.notna(net_mtt):
-        mtt_share = min(1.0, max(0.0, net_mtt / net_total)) if net_total else 0.0
+    if pd.notna(net_total) and net_total > 0 and pd.notna(net_mtt) and net_total != 0:
+        mtt_share = min(1.0, max(0.0, net_mtt / net_total))
         if mtt_share >= 0.7:
             reasons.append(f"High MTT/SNG share ({mtt_share:.0%}) -> lower risk")
             score -= 15
 
     # Ring increases suspicion if profit mainly via ring
-    if pd.notna(net_total) and net_total > 0 and pd.notna(net_ring):
-        ring_share = min(1.0, max(0.0, net_ring / net_total)) if net_total else 0.0
+    if pd.notna(net_total) and net_total > 0 and pd.notna(net_ring) and net_total != 0:
+        ring_share = min(1.0, max(0.0, net_ring / net_total))
         if ring_share >= 0.7:
             reasons.append(f"High Ring share ({ring_share:.0%}) -> higher risk")
             score += 15
@@ -184,7 +212,7 @@ st.title("PPPoker: авто-оценка риска вывода (Excel-вход
 with st.sidebar:
     st.header("Загрузка файлов")
     summary_file = st.file_uploader("Общая таблица (.xlsx)", type=["xlsx"])
-    games_file = st.file_uploader("Игры/сессии (как выгрузка)", type=["csv", "txt"])
+    games_file = st.file_uploader("Игры/сессии (выгрузка)", type=["csv", "txt"])
 
 st.divider()
 
@@ -192,34 +220,41 @@ if not summary_file or not games_file:
     st.info("Загрузи Excel 'общая таблица' и файл 'игры'.")
     st.stop()
 
+# Read summary
 df = read_summary_excel(summary_file)
 
 df["_player_id"] = pd.to_numeric(df.iloc[:, IDX_ID], errors="coerce")
 df = df.dropna(subset=["_player_id"]).copy()
 df["_player_id"] = df["_player_id"].astype(int)
 
-# numeric fields from fixed excel columns
 df["_net_total"] = to_float_series(df.iloc[:, IDX_NET_TOTAL])
 df["_net_ring"] = to_float_series(df.iloc[:, IDX_NET_RING])
 df["_net_mtt"] = to_float_series(df.iloc[:, IDX_NET_MTT])
 df["_comm"] = to_float_series(df.iloc[:, IDX_COMM])
 
 known_ids = set(df["_player_id"].tolist())
+
+# Build sessions
 sessions_df = build_coplay_from_games(games_file, known_ids)
 
 col1, col2 = st.columns([1, 2], gap="large")
 
 with col1:
     st.subheader("Проверка вывода")
-    target_id = st.number_input("ID игрока", min_value=0, value=int(df['_player_id'].iloc[0]))
+    default_id = int(df["_player_id"].iloc[0]) if len(df) else 0
+    target_id = st.number_input("ID игрока", min_value=0, value=default_id, step=1)
     run = st.button("Оценить риск")
 
 with col2:
     st.subheader("Диагностика")
     st.write(f"Игроков в Excel: {len(df)}")
     st.write(f"Сессий (из games): {len(sessions_df)}")
-    st.caption("Если сессий = 0, значит парсер не нашёл блоки с 'ID ...' или ID игроков не совпали с Excel. "
-               "В таком случае пришли пример 20 строк 'игры' из начала файла.")
+    st.write("sessions_df columns:", list(sessions_df.columns))
+
+    st.caption(
+        "Если сессий = 0 — значит парсер не нашёл блоки 'ID ...' или ID игроков в games не совпали с Excel. "
+        "В этом случае пришли сюда 30-50 строк из начала файла 'игры'."
+    )
 
 if not run:
     st.stop()
@@ -237,7 +272,7 @@ score, reasons = score_player(
     net_ring=row["_net_ring"],
     net_mtt=row["_net_mtt"],
     comm=row["_comm"],
-    cop=cop
+    cop=cop,
 )
 decision = risk_decision(score)
 
@@ -248,20 +283,27 @@ for r in reasons[:12]:
     st.write("- " + r)
 
 st.subheader("Co-play (контакты)")
-st.write({
-    "sessions_count": cop["sessions_count"],
-    "unique_opponents": cop["unique_opponents"],
-    "top1_coplay_share": cop["top1_coplay_share"],
-    "top2_coplay_share": cop["top2_coplay_share"],
-})
+st.write(
+    {
+        "sessions_count": cop["sessions_count"],
+        "unique_opponents": cop["unique_opponents"],
+        "top1_coplay_share": cop["top1_coplay_share"],
+        "top2_coplay_share": cop["top2_coplay_share"],
+    }
+)
+
 if cop["top_partners"]:
-    st.dataframe(pd.DataFrame(cop["top_partners"], columns=["partner_id", "coplay_sessions"]),
-                 use_container_width=True)
+    st.dataframe(
+        pd.DataFrame(cop["top_partners"], columns=["partner_id", "coplay_sessions"]),
+        use_container_width=True,
+    )
 
 st.subheader("Экономика (из Excel)")
-st.write({
-    "net_total (I)": row["_net_total"],
-    "ring (O)": row["_net_ring"],
-    "mtt/sng (P)": row["_net_mtt"],
-    "commission (AB)": row["_comm"],
-})
+st.write(
+    {
+        "net_total (I)": row["_net_total"],
+        "ring (O)": row["_net_ring"],
+        "mtt/sng (P)": row["_net_mtt"],
+        "commission (AB)": row["_comm"],
+    }
+)
