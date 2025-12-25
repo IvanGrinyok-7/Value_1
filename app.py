@@ -1,4 +1,7 @@
 import re
+import hashlib
+import datetime as dt
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -17,23 +20,28 @@ def col_idx(col_letter: str) -> int:
     return n - 1
 
 
+# Excel columns (общая таблица)
 IDX_ID = col_idx("A")         # A - ID
 IDX_NET_TOTAL = col_idx("I")  # I - общий выигрыш
 IDX_NET_RING = col_idx("O")   # O - Ring Game
 IDX_NET_MTT = col_idx("P")    # P - MTT/SNG
 IDX_COMM = col_idx("AB")      # AB - комиссия
 
+# Decision thresholds
 T_APPROVE = 25
 T_FAST_CHECK = 55
 
+# co-play thresholds
 MIN_SESSIONS_FOR_COPLAY = 6
 COPLAY_TOP1_SHARE_SUSP = 0.60
 COPLAY_TOP2_SHARE_SUSP = 0.80
 
+# transfer proxy thresholds
 PAIR_NET_TRANSFER_ALERT_RING = 25.0
 PAIR_NET_TRANSFER_ALERT_TOUR = 60.0
 PAIR_DOMINANCE_ALERT = 0.70
 
+# single-game extremes
 SINGLE_GAME_WIN_ALERT_RING = 60.0
 SINGLE_GAME_LOSS_ALERT_RING = 60.0
 SINGLE_GAME_WIN_ALERT_TOUR = 150.0
@@ -43,6 +51,56 @@ SINGLE_GAME_LOSS_ALERT_TOUR = 150.0
 # =========================
 # HELPERS
 # =========================
+def now_local() -> dt.datetime:
+    # Простая логика: серверное время Streamlit (без tz).
+    return dt.datetime.now()
+
+
+def md5_bytes(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
+
+
+def update_upload_state(state_prefix: str, uploaded_file):
+    """
+    Stores:
+      - <prefix>_hash
+      - <prefix>_ts (datetime)
+      - <prefix>_name
+    Updates timestamp only when file content hash changed.
+    """
+    h_key = f"{state_prefix}_hash"
+    ts_key = f"{state_prefix}_ts"
+    nm_key = f"{state_prefix}_name"
+
+    if uploaded_file is None:
+        return
+
+    content = uploaded_file.getvalue()
+    h = md5_bytes(content)
+    old = st.session_state.get(h_key)
+
+    if old != h:
+        st.session_state[h_key] = h
+        st.session_state[ts_key] = now_local()
+        st.session_state[nm_key] = getattr(uploaded_file, "name", "uploaded")
+
+
+def get_upload_ts(state_prefix: str):
+    return st.session_state.get(f"{state_prefix}_ts")
+
+
+def fmt_ts(ts) -> str:
+    if not ts:
+        return "—"
+    return ts.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_stale(ts: dt.datetime | None) -> bool:
+    if ts is None:
+        return True
+    return now_local().date() > ts.date()
+
+
 def to_float(x) -> float:
     if x is None:
         return np.nan
@@ -109,6 +167,9 @@ def classify_game_type(lines_in_block: list[str]) -> str:
 
 
 def parse_games_csv(uploaded_file, known_player_ids: set[int]) -> pd.DataFrame:
+    if uploaded_file is None:
+        return pd.DataFrame(columns=["game_id", "game_type", "player_id", "win", "fee"])
+
     raw = uploaded_file.getvalue()
     text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
     lines = text.splitlines()
@@ -153,15 +214,17 @@ def parse_games_csv(uploaded_file, known_player_ids: set[int]) -> pd.DataFrame:
         win = np.nan
         fee = np.nan
 
+        # Tournament style
         if header_cols is not None and len(parts) == len(header_cols):
             if "Выигрыш" in header_cols:
                 win = to_float(parts[header_cols.index("Выигрыш")])
             if "Комиссия" in header_cols:
                 fee = to_float(parts[header_cols.index("Комиссия")])
         else:
+            # Ring fallback: ...;Раздачи;Выигрыш игрока;...
             if len(parts) >= 7:
                 win = to_float(parts[6])
-
+            # Fee fallback
             tail = parts[-6:] if len(parts) >= 6 else parts
             candidates = [to_float(t) for t in tail]
             candidates = [c for c in candidates if not np.isnan(c)]
@@ -170,10 +233,7 @@ def parse_games_csv(uploaded_file, known_player_ids: set[int]) -> pd.DataFrame:
                 fee = min(pos) if pos else np.nan
 
         gtype = classify_game_type(current_block_lines)
-
-        rows.append(
-            {"game_id": current_game_id, "game_type": gtype, "player_id": pid, "win": win, "fee": fee}
-        )
+        rows.append({"game_id": current_game_id, "game_type": gtype, "player_id": pid, "win": win, "fee": fee})
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -202,13 +262,7 @@ def build_sessions_from_games(games_df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 def coplay_features(target_id: int, sessions_df: pd.DataFrame, game_type: str | None = None) -> dict:
     if sessions_df.empty or "players" not in sessions_df.columns:
-        return {
-            "sessions_count": 0,
-            "unique_opponents": 0,
-            "top1_coplay_share": 0.0,
-            "top2_coplay_share": 0.0,
-            "top_partners": [],
-        }
+        return {"sessions_count": 0, "unique_opponents": 0, "top1_coplay_share": 0.0, "top2_coplay_share": 0.0, "top_partners": []}
 
     df = sessions_df
     if game_type:
@@ -216,15 +270,8 @@ def coplay_features(target_id: int, sessions_df: pd.DataFrame, game_type: str | 
 
     rows = df[df["players"].apply(lambda ps: target_id in ps)]
     sessions_count = int(len(rows))
-
     if sessions_count == 0:
-        return {
-            "sessions_count": 0,
-            "unique_opponents": 0,
-            "top1_coplay_share": 0.0,
-            "top2_coplay_share": 0.0,
-            "top_partners": [],
-        }
+        return {"sessions_count": 0, "unique_opponents": 0, "top1_coplay_share": 0.0, "top2_coplay_share": 0.0, "top_partners": []}
 
     counter = {}
     for ps in rows["players"]:
@@ -235,7 +282,6 @@ def coplay_features(target_id: int, sessions_df: pd.DataFrame, game_type: str | 
 
     partners = sorted(counter.items(), key=lambda x: x[1], reverse=True)
     unique_opponents = len(partners)
-
     top1 = partners[0][1] if len(partners) >= 1 else 0
     top2 = partners[1][1] if len(partners) >= 2 else 0
     top1_share = top1 / sessions_count if sessions_count else 0.0
@@ -252,14 +298,7 @@ def coplay_features(target_id: int, sessions_df: pd.DataFrame, game_type: str | 
 
 def transfer_features(target_id: int, games_df: pd.DataFrame, game_type: str | None = None) -> dict:
     if games_df.empty:
-        return {
-            "target_games": 0,
-            "target_total_win_from_games": 0.0,
-            "top_sources": [],
-            "top_source_net": 0.0,
-            "top_source_share": 0.0,
-            "single_game_extremes": [],
-        }
+        return {"target_games": 0, "target_total_win_from_games": 0.0, "top_sources": [], "top_source_net": 0.0, "top_source_share": 0.0, "single_game_extremes": []}
 
     df = games_df.copy()
     if game_type:
@@ -267,36 +306,20 @@ def transfer_features(target_id: int, games_df: pd.DataFrame, game_type: str | N
 
     df = df[pd.notna(df["win"])].copy()
     if df.empty:
-        return {
-            "target_games": 0,
-            "target_total_win_from_games": 0.0,
-            "top_sources": [],
-            "top_source_net": 0.0,
-            "top_source_share": 0.0,
-            "single_game_extremes": [],
-        }
+        return {"target_games": 0, "target_total_win_from_games": 0.0, "top_sources": [], "top_source_net": 0.0, "top_source_share": 0.0, "single_game_extremes": []}
 
     t = df[df["player_id"] == target_id][["game_id", "win"]].copy()
     target_games = int(len(t))
     if target_games == 0:
-        return {
-            "target_games": 0,
-            "target_total_win_from_games": 0.0,
-            "top_sources": [],
-            "top_source_net": 0.0,
-            "top_source_share": 0.0,
-            "single_game_extremes": [],
-        }
+        return {"target_games": 0, "target_total_win_from_games": 0.0, "top_sources": [], "top_source_net": 0.0, "top_source_share": 0.0, "single_game_extremes": []}
 
     transfer = {}
     extremes = []
 
     if game_type == "TOURNAMENT":
-        win_alert = SINGLE_GAME_WIN_ALERT_TOUR
-        loss_alert = SINGLE_GAME_LOSS_ALERT_TOUR
+        win_alert, loss_alert = SINGLE_GAME_WIN_ALERT_TOUR, SINGLE_GAME_LOSS_ALERT_TOUR
     else:
-        win_alert = SINGLE_GAME_WIN_ALERT_RING
-        loss_alert = SINGLE_GAME_LOSS_ALERT_RING
+        win_alert, loss_alert = SINGLE_GAME_WIN_ALERT_RING, SINGLE_GAME_LOSS_ALERT_RING
 
     for _, tr in t.iterrows():
         gid = tr["game_id"]
@@ -321,7 +344,6 @@ def transfer_features(target_id: int, games_df: pd.DataFrame, game_type: str | N
 
     total_from_sources = float(sum(transfer.values()))
     sources_sorted = sorted(transfer.items(), key=lambda x: x[1], reverse=True)
-
     top_source_net = float(sources_sorted[0][1]) if sources_sorted else 0.0
     top_source_share = (top_source_net / total_from_sources) if total_from_sources > 0 else 0.0
 
@@ -336,20 +358,11 @@ def transfer_features(target_id: int, games_df: pd.DataFrame, game_type: str | N
 
 
 # =========================
-# SCORING + STRUCTURED OUTPUT + MAIN RISK
+# SCORING + OUTPUT
 # =========================
 def pick_main_risk(decision: str, sb_reasons: list[str], coverage: dict) -> str:
-    """
-    One short phrase for operators.
-    Priority:
-      1) Most severe SB reason (if any)
-      2) No games coverage -> insufficient evidence
-      3) By decision default
-    """
     if sb_reasons:
-        txt = sb_reasons[0]
-        # Make it shorter if needed
-        txt = txt.replace("RING:", "RING —").replace("TOURNAMENT:", "TOURNAMENT —")
+        txt = sb_reasons[0].replace("RING:", "RING —").replace("TOURNAMENT:", "TOURNAMENT —")
         return txt
 
     if coverage["ring_games_with_target"] == 0 and coverage["tour_games_with_target"] == 0 and coverage["unknown_games_with_target"] == 0:
@@ -369,7 +382,6 @@ def structured_assessment(row, cop_ring, cop_tour, trf_ring, trf_tour, coverage)
     comm = row["_comm"]
 
     score = 0
-
     blocks = {
         "Ключевой вывод": [],
         "Покрытие данных": [],
@@ -385,7 +397,7 @@ def structured_assessment(row, cop_ring, cop_tour, trf_ring, trf_tour, coverage)
         f"UNKNOWN: {coverage['unknown_games_with_target']}."
     )
 
-    # Excel profile
+    # Excel
     if pd.notna(net_total):
         blocks["Профиль игрока (Excel)"].append(f"Общий выигрыш (I): {fmt_money(net_total)}.")
         if net_total > 0:
@@ -440,14 +452,14 @@ def structured_assessment(row, cop_ring, cop_tour, trf_ring, trf_tour, coverage)
     else:
         blocks["Сеть/поведение (co-play)"].append("RING: данных по совместной игре мало/нет.")
 
-    # Transfer proxy
+    # Transfer
     blocks["Перелив (transfer-proxy)"].append(
         f"RING: игр={trf_ring['target_games']}, суммарный результат={fmt_money(trf_ring['target_total_win_from_games'])}, "
-        f"топ-источник={fmt_money(trf_ring['top_source_net'])}, доля топ-источника={trf_ring['top_source_share']:.0%}."
+        f"топ-источник={fmt_money(trf_ring['top_source_net'])}, доля={trf_ring['top_source_share']:.0%}."
     )
     blocks["Перелив (transfer-proxy)"].append(
         f"TOURNAMENT: игр={trf_tour['target_games']}, суммарный результат={fmt_money(trf_tour['target_total_win_from_games'])}, "
-        f"топ-источник={fmt_money(trf_tour['top_source_net'])}, доля топ-источника={trf_tour['top_source_share']:.0%}."
+        f"топ-источник={fmt_money(trf_tour['top_source_net'])}, доля={trf_tour['top_source_share']:.0%}."
     )
 
     if trf_ring["top_sources"]:
@@ -492,10 +504,40 @@ def structured_assessment(row, cop_ring, cop_tour, trf_ring, trf_tour, coverage)
     if decision == "MANUAL_REVIEW" and not blocks["Причины для ручной проверки СБ"]:
         blocks["Причины для ручной проверки СБ"].append("Общий риск высокий по совокупности факторов (см. детали).")
 
-    # MAIN RISK: one phrase
     main_risk = pick_main_risk(decision, blocks["Причины для ручной проверки СБ"], coverage)
-
     return score, decision, main_risk, blocks
+
+
+# =========================
+# LOAD + MERGE (2 WINDOWS)
+# =========================
+def load_excel_period(uploaded_excel) -> pd.DataFrame:
+    if uploaded_excel is None:
+        return pd.DataFrame(columns=["_player_id", "_net_total", "_net_ring", "_net_mtt", "_comm"])
+
+    x = read_summary_excel(uploaded_excel)
+    x["_player_id"] = pd.to_numeric(x.iloc[:, IDX_ID], errors="coerce")
+    x = x.dropna(subset=["_player_id"]).copy()
+    x["_player_id"] = x["_player_id"].astype(int)
+
+    x["_net_total"] = to_float_series(x.iloc[:, IDX_NET_TOTAL])
+    x["_net_ring"] = to_float_series(x.iloc[:, IDX_NET_RING])
+    x["_net_mtt"] = to_float_series(x.iloc[:, IDX_NET_MTT])
+    x["_comm"] = to_float_series(x.iloc[:, IDX_COMM])
+
+    return x[["_player_id", "_net_total", "_net_ring", "_net_mtt", "_comm"]].copy()
+
+
+def merge_excels(ex1: pd.DataFrame, ex2: pd.DataFrame) -> pd.DataFrame:
+    if ex1.empty and ex2.empty:
+        return pd.DataFrame(columns=["_player_id", "_net_total", "_net_ring", "_net_mtt", "_comm"])
+
+    both = pd.concat([ex1, ex2], ignore_index=True)
+    merged = (
+        both.groupby("_player_id", as_index=False)[["_net_total", "_net_ring", "_net_mtt", "_comm"]]
+        .sum(min_count=1)
+    )
+    return merged
 
 
 # =========================
@@ -505,38 +547,84 @@ st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
 with st.sidebar:
-    st.header("Загрузка данных")
-    summary_file = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker", type=["xlsx"])
-    games_file = st.file_uploader("Игры (.csv) — выгрузка PPPoker", type=["csv", "txt"])
+    st.header("Загрузка данных (2 недели)")
+
+    st.subheader("Окно 1: прошлая неделя")
+    excel_w1 = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker (прошлая неделя)", type=["xlsx"], key="excel_w1")
+    games_w1 = st.file_uploader("Игры (.csv) — выгрузка PPPoker (прошлая неделя)", type=["csv", "txt"], key="games_w1")
+
+    st.subheader("Окно 2: позапрошлая неделя")
+    excel_w2 = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker (позапрошлая неделя)", type=["xlsx"], key="excel_w2")
+    games_w2 = st.file_uploader("Игры (.csv) — выгрузка PPPoker (позапрошлая неделя)", type=["csv", "txt"], key="games_w2")
+
     show_debug = st.checkbox("Показать технические детали", value=False)
+
+    # фиксируем timestamps при смене файлов
+    update_upload_state("excel_w1", excel_w1)
+    update_upload_state("games_w1", games_w1)
+    update_upload_state("excel_w2", excel_w2)
+    update_upload_state("games_w2", games_w2)
+
+    st.divider()
+    st.subheader("Актуальность данных")
+
+    ts_excel_w1 = get_upload_ts("excel_w1")
+    ts_games_w1 = get_upload_ts("games_w1")
+    ts_excel_w2 = get_upload_ts("excel_w2")
+    ts_games_w2 = get_upload_ts("games_w2")
+
+    st.write(f"Прошлая неделя: Excel загружен: {fmt_ts(ts_excel_w1)}")
+    st.write(f"Прошлая неделя: Игры загружены: {fmt_ts(ts_games_w1)}")
+    st.write(f"Позапрошлая неделя: Excel загружен: {fmt_ts(ts_excel_w2)}")
+    st.write(f"Позапрошлая неделя: Игры загружены: {fmt_ts(ts_games_w2)}")
+
+    # Индикатор "наступил новый день -> обновить"
+    stale_required = is_stale(ts_excel_w1) or is_stale(ts_games_w1)
+    stale_optional = (excel_w2 is not None or games_w2 is not None) and (is_stale(ts_excel_w2) or is_stale(ts_games_w2))
+
+    if stale_required:
+        st.error("Данные (прошлая неделя) устарели: наступил новый день — нужно обновить выгрузки.")
+    else:
+        st.success("Данные (прошлая неделя) актуальны на сегодня.")
+
+    if excel_w2 is not None or games_w2 is not None:
+        if stale_optional:
+            st.warning("Данные (позапрошлая неделя) устарели: рекомендуется обновить, если используешь окно 2.")
+        else:
+            st.success("Данные (позапрошлая неделя) актуальны на сегодня.")
+
+    if st.button("Сбросить отметки времени (только индикатор)", type="secondary"):
+        for k in ["excel_w1_ts", "games_w1_ts", "excel_w2_ts", "games_w2_ts"]:
+            if k in st.session_state:
+                del st.session_state[k]
+
 
 st.divider()
 
-if not summary_file or not games_file:
-    st.info("Шаг 1: загрузи оба файла. Шаг 2: введи ID игрока и нажми «Проверить».")
+# Минимально обязательны: окно 1 (и Excel, и Games)
+if excel_w1 is None or games_w1 is None:
+    st.info("Загрузи как минимум файлы «прошлая неделя»: Excel + Игры. Окно 2 — дополнительно.")
     st.stop()
 
-# Load Excel
-df = read_summary_excel(summary_file)
-df["_player_id"] = pd.to_numeric(df.iloc[:, IDX_ID], errors="coerce")
-df = df.dropna(subset=["_player_id"]).copy()
-df["_player_id"] = df["_player_id"].astype(int)
+# Load + merge Excel (2 weeks)
+ex1 = load_excel_period(excel_w1)
+ex2 = load_excel_period(excel_w2) if excel_w2 is not None else pd.DataFrame(columns=ex1.columns)
 
-df["_net_total"] = to_float_series(df.iloc[:, IDX_NET_TOTAL])
-df["_net_ring"] = to_float_series(df.iloc[:, IDX_NET_RING])
-df["_net_mtt"] = to_float_series(df.iloc[:, IDX_NET_MTT])
-df["_comm"] = to_float_series(df.iloc[:, IDX_COMM])
+df = merge_excels(ex1, ex2)
 
 known_ids = set(df["_player_id"].tolist())
 
-# Parse games
-games_df = parse_games_csv(games_file, known_ids)
+# Parse + merge games (2 weeks)
+g1 = parse_games_csv(games_w1, known_ids)
+g2 = parse_games_csv(games_w2, known_ids) if games_w2 is not None else pd.DataFrame(columns=g1.columns)
+games_df = pd.concat([g1, g2], ignore_index=True)
+
 sessions_df = build_sessions_from_games(games_df)
 
 # Top status bar
 c1, c2, c3, c4 = st.columns(4, gap="small")
-c1.metric("Игроков в Excel", f"{len(df)}", border=True)
-c2.metric("Строк games", f"{len(games_df)}", border=True)
+c1.metric("Игроков (сумма 2 недель)", f"{len(df)}", border=True)
+c2.metric("Строк games (сумма 2 недель)", f"{len(games_df)}", border=True)
 c3.metric("Сессий (ID игры ≥2 игрока)", f"{len(sessions_df)}", border=True)
 if not games_df.empty and "game_type" in games_df.columns:
     dist = dict(games_df["game_type"].value_counts())
@@ -547,20 +635,19 @@ else:
 st.divider()
 
 left, right = st.columns([1, 2], gap="large")
-
 with left:
     st.subheader("Проверка игрока")
     default_id = int(df["_player_id"].iloc[0]) if len(df) else 0
     target_id = st.number_input("ID игрока на вывод", min_value=0, value=default_id, step=1)
     run = st.button("Проверить", type="primary")
-    st.caption("Если по игроку мало игр в файле «Игры», вывод будет более консервативным.")
+    st.caption("Аналитика считается по сумме 2 недель (если загружено окно 2).")
 
 with right:
     st.subheader("Краткая инструкция")
     st.markdown(
-        "- Загрузи **оба файла** (общая таблица и игры).\n"
-        "- Введи ID игрока.\n"
-        "- Нажми «Проверить» и смотри **итог** + **причины**."
+        "- Окно 1 (прошлая неделя) — **обязательно**.\n"
+        "- Окно 2 (позапрошлая неделя) — **дополнительно**, улучшает точность.\n"
+        "- Нажми «Проверить»: увидишь **главный риск** + причины."
     )
 
 if not run:
@@ -568,12 +655,12 @@ if not run:
 
 row_df = df[df["_player_id"] == int(target_id)]
 if row_df.empty:
-    st.error("ID игрока не найден в Excel.")
+    st.error("ID игрока не найден в суммарной Excel (2 недели).")
     st.stop()
 
 row = row_df.iloc[0]
 
-# Coverage for player
+# Coverage for player (combined games)
 target_games = games_df[games_df["player_id"] == int(target_id)] if not games_df.empty else pd.DataFrame()
 coverage = {
     "ring_games_with_target": int((target_games["game_type"] == "RING").sum()) if not target_games.empty else 0,
@@ -592,16 +679,11 @@ score, decision, main_risk, blocks = structured_assessment(row, cop_ring, cop_to
 st.divider()
 
 # ======= RESULT HEADER =======
-header_left, header_mid, header_right = st.columns([1.2, 1, 1], gap="small")
-
-with header_left:
+h1, h2, h3 = st.columns([1.2, 1, 1], gap="small")
+with h1:
     st.subheader("Итог")
-
-with header_mid:
-    st.metric("Risk score", f"{score}/100", border=True, help="0 = низкий риск, 100 = высокий риск.")
-
-with header_right:
-    st.metric("Decision", decision, border=True, help="APPROVE / FAST_CHECK / MANUAL_REVIEW")
+h2.metric("Risk score", f"{score}/100", border=True, help="0 = низкий риск, 100 = высокий риск.")
+h3.metric("Decision", decision, border=True, help="APPROVE / FAST_CHECK / MANUAL_REVIEW")
 
 if decision == "APPROVE":
     pill("ВЫВОД: РАЗРЕШИТЬ", "ok")
@@ -614,7 +696,6 @@ tab1, tab2, tab3 = st.tabs(["Кратко", "Детали", "Пары / исто
 
 with tab1:
     st.subheader("Главный риск")
-    # заметная короткая строка
     st.info(f"**Главный риск:** {main_risk}")
 
     st.subheader("Ключевой вывод")
@@ -628,12 +709,12 @@ with tab1:
     else:
         st.markdown("- Явных причин для ручной проверки СБ по текущим данным не выявлено.")
 
-    st.subheader("Покрытие данных")
+    st.subheader("Покрытие данных (2 недели)")
     for x in blocks["Покрытие данных"]:
         st.markdown(f"- {x}")
 
 with tab2:
-    st.subheader("Профиль игрока (Excel)")
+    st.subheader("Профиль игрока (сумма 2 недель)")
     for x in blocks["Профиль игрока (Excel)"]:
         st.markdown(f"- {x}")
 
@@ -673,33 +754,20 @@ with tab3:
 
     st.subheader("Источники transfer-proxy (RING)")
     if trf_ring["top_sources"]:
-        st.dataframe(
-            pd.DataFrame(trf_ring["top_sources"], columns=["source_player_id", "estimated_transfer_to_target"]),
-            use_container_width=True,
-        )
+        st.dataframe(pd.DataFrame(trf_ring["top_sources"], columns=["source_player_id", "estimated_transfer_to_target"]), use_container_width=True)
     else:
         st.info("Нет выраженных источников в RING (по текущим данным/окну).")
 
     st.subheader("Источники transfer-proxy (TOURNAMENT)")
     if trf_tour["top_sources"]:
-        st.dataframe(
-            pd.DataFrame(trf_tour["top_sources"], columns=["source_player_id", "estimated_transfer_to_target"]),
-            use_container_width=True,
-        )
+        st.dataframe(pd.DataFrame(trf_tour["top_sources"], columns=["source_player_id", "estimated_transfer_to_target"]), use_container_width=True)
     else:
         st.info("Нет выраженных источников в TOURNAMENT (по текущим данным/окну).")
 
-    if show_debug:
-        with st.expander("Debug: экстремальные игры", expanded=False):
-            if trf_ring["single_game_extremes"]:
-                st.write("RING extremes")
-                st.dataframe(pd.DataFrame(trf_ring["single_game_extremes"]), use_container_width=True)
-            if trf_tour["single_game_extremes"]:
-                st.write("TOURNAMENT extremes")
-                st.dataframe(pd.DataFrame(trf_tour["single_game_extremes"]), use_container_width=True)
-
 if show_debug:
-    with st.expander("Debug: сырые таблицы (games/sessions)", expanded=False):
+    with st.expander("Debug: сырые таблицы (Excel/Games/Sessions)", expanded=False):
+        st.write("Excel (merged) head:")
+        st.dataframe(df.head(50), use_container_width=True)
         st.write("games_df head:")
         st.dataframe(games_df.head(50), use_container_width=True)
         st.write("sessions_df head:")
