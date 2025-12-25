@@ -1,7 +1,4 @@
 import re
-import hashlib
-import datetime as dt
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -38,7 +35,7 @@ COPLAY_TOP2_SHARE_SUSP = 0.80
 
 # transfer proxy thresholds
 PAIR_NET_TRANSFER_ALERT_RING = 25.0
-PAIR_NET_TRANSFER_ALERT_TOUR = 60.0
+PAIR_NET_TRANSFER_ALERT_TOUR = 60.0  # tournaments are noisier -> higher threshold
 PAIR_DOMINANCE_ALERT = 0.70
 
 # single-game extremes
@@ -51,56 +48,6 @@ SINGLE_GAME_LOSS_ALERT_TOUR = 150.0
 # =========================
 # HELPERS
 # =========================
-def now_local() -> dt.datetime:
-    # Простая логика: серверное время Streamlit (без tz).
-    return dt.datetime.now()
-
-
-def md5_bytes(b: bytes) -> str:
-    return hashlib.md5(b).hexdigest()
-
-
-def update_upload_state(state_prefix: str, uploaded_file):
-    """
-    Stores:
-      - <prefix>_hash
-      - <prefix>_ts (datetime)
-      - <prefix>_name
-    Updates timestamp only when file content hash changed.
-    """
-    h_key = f"{state_prefix}_hash"
-    ts_key = f"{state_prefix}_ts"
-    nm_key = f"{state_prefix}_name"
-
-    if uploaded_file is None:
-        return
-
-    content = uploaded_file.getvalue()
-    h = md5_bytes(content)
-    old = st.session_state.get(h_key)
-
-    if old != h:
-        st.session_state[h_key] = h
-        st.session_state[ts_key] = now_local()
-        st.session_state[nm_key] = getattr(uploaded_file, "name", "uploaded")
-
-
-def get_upload_ts(state_prefix: str):
-    return st.session_state.get(f"{state_prefix}_ts")
-
-
-def fmt_ts(ts) -> str:
-    if not ts:
-        return "—"
-    return ts.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def is_stale(ts: dt.datetime | None) -> bool:
-    if ts is None:
-        return True
-    return now_local().date() > ts.date()
-
-
 def to_float(x) -> float:
     if x is None:
         return np.nan
@@ -224,6 +171,7 @@ def parse_games_csv(uploaded_file, known_player_ids: set[int]) -> pd.DataFrame:
             # Ring fallback: ...;Раздачи;Выигрыш игрока;...
             if len(parts) >= 7:
                 win = to_float(parts[6])
+
             # Fee fallback
             tail = parts[-6:] if len(parts) >= 6 else parts
             candidates = [to_float(t) for t in tail]
@@ -362,8 +310,7 @@ def transfer_features(target_id: int, games_df: pd.DataFrame, game_type: str | N
 # =========================
 def pick_main_risk(decision: str, sb_reasons: list[str], coverage: dict) -> str:
     if sb_reasons:
-        txt = sb_reasons[0].replace("RING:", "RING —").replace("TOURNAMENT:", "TOURNAMENT —")
-        return txt
+        return sb_reasons[0].replace("RING:", "RING —").replace("TOURNAMENT:", "TOURNAMENT —")
 
     if coverage["ring_games_with_target"] == 0 and coverage["tour_games_with_target"] == 0 and coverage["unknown_games_with_target"] == 0:
         return "Недостаточно данных по играм: по файлу «Игры» игрок не найден."
@@ -533,10 +480,7 @@ def merge_excels(ex1: pd.DataFrame, ex2: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["_player_id", "_net_total", "_net_ring", "_net_mtt", "_comm"])
 
     both = pd.concat([ex1, ex2], ignore_index=True)
-    merged = (
-        both.groupby("_player_id", as_index=False)[["_net_total", "_net_ring", "_net_mtt", "_comm"]]
-        .sum(min_count=1)
-    )
+    merged = both.groupby("_player_id", as_index=False)[["_net_total", "_net_ring", "_net_mtt", "_comm"]].sum(min_count=1)
     return merged
 
 
@@ -559,49 +503,9 @@ with st.sidebar:
 
     show_debug = st.checkbox("Показать технические детали", value=False)
 
-    # фиксируем timestamps при смене файлов
-    update_upload_state("excel_w1", excel_w1)
-    update_upload_state("games_w1", games_w1)
-    update_upload_state("excel_w2", excel_w2)
-    update_upload_state("games_w2", games_w2)
-
-    st.divider()
-    st.subheader("Актуальность данных")
-
-    ts_excel_w1 = get_upload_ts("excel_w1")
-    ts_games_w1 = get_upload_ts("games_w1")
-    ts_excel_w2 = get_upload_ts("excel_w2")
-    ts_games_w2 = get_upload_ts("games_w2")
-
-    st.write(f"Прошлая неделя: Excel загружен: {fmt_ts(ts_excel_w1)}")
-    st.write(f"Прошлая неделя: Игры загружены: {fmt_ts(ts_games_w1)}")
-    st.write(f"Позапрошлая неделя: Excel загружен: {fmt_ts(ts_excel_w2)}")
-    st.write(f"Позапрошлая неделя: Игры загружены: {fmt_ts(ts_games_w2)}")
-
-    # Индикатор "наступил новый день -> обновить"
-    stale_required = is_stale(ts_excel_w1) or is_stale(ts_games_w1)
-    stale_optional = (excel_w2 is not None or games_w2 is not None) and (is_stale(ts_excel_w2) or is_stale(ts_games_w2))
-
-    if stale_required:
-        st.error("Данные (прошлая неделя) устарели: наступил новый день — нужно обновить выгрузки.")
-    else:
-        st.success("Данные (прошлая неделя) актуальны на сегодня.")
-
-    if excel_w2 is not None or games_w2 is not None:
-        if stale_optional:
-            st.warning("Данные (позапрошлая неделя) устарели: рекомендуется обновить, если используешь окно 2.")
-        else:
-            st.success("Данные (позапрошлая неделя) актуальны на сегодня.")
-
-    if st.button("Сбросить отметки времени (только индикатор)", type="secondary"):
-        for k in ["excel_w1_ts", "games_w1_ts", "excel_w2_ts", "games_w2_ts"]:
-            if k in st.session_state:
-                del st.session_state[k]
-
-
 st.divider()
 
-# Минимально обязательны: окно 1 (и Excel, и Games)
+# Minimal requirement: window 1 (Excel + Games)
 if excel_w1 is None or games_w1 is None:
     st.info("Загрузи как минимум файлы «прошлая неделя»: Excel + Игры. Окно 2 — дополнительно.")
     st.stop()
@@ -609,7 +513,6 @@ if excel_w1 is None or games_w1 is None:
 # Load + merge Excel (2 weeks)
 ex1 = load_excel_period(excel_w1)
 ex2 = load_excel_period(excel_w2) if excel_w2 is not None else pd.DataFrame(columns=ex1.columns)
-
 df = merge_excels(ex1, ex2)
 
 known_ids = set(df["_player_id"].tolist())
@@ -635,6 +538,7 @@ else:
 st.divider()
 
 left, right = st.columns([1, 2], gap="large")
+
 with left:
     st.subheader("Проверка игрока")
     default_id = int(df["_player_id"].iloc[0]) if len(df) else 0
