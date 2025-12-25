@@ -1,4 +1,10 @@
 import re
+import os
+import io
+import json
+import datetime as dt
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -8,6 +14,9 @@ import streamlit as st
 # CONFIG / CONSTANTS
 # =========================
 APP_TITLE = "PPPoker: проверка риска вывода покерного клуба Value"
+
+CACHE_DIR = Path(".pppoker_uploaded_cache")  # server-side cache folder
+CACHE_DIR.mkdir(exist_ok=True)
 
 def col_idx(col_letter: str) -> int:
     col_letter = col_letter.strip().upper()
@@ -46,6 +55,98 @@ SINGLE_GAME_LOSS_ALERT_TOUR = 150.0
 
 
 # =========================
+# SERVER-SIDE FILE PERSISTENCE
+# =========================
+class BytesFile:
+    """Minimal file-like object compatible with our readers (getvalue + name)."""
+    def __init__(self, content: bytes, name: str):
+        self._content = content
+        self.name = name
+
+    def getvalue(self) -> bytes:
+        return self._content
+
+
+def _bin_path(key: str) -> Path:
+    return CACHE_DIR / f"{key}.bin"
+
+
+def _meta_path(key: str) -> Path:
+    return CACHE_DIR / f"{key}.json"
+
+
+def cache_save_uploaded(key: str, uploaded_file) -> None:
+    """Save uploaded file content to disk. Overwrites existing cache."""
+    if uploaded_file is None:
+        return
+    content = uploaded_file.getvalue()
+    name = getattr(uploaded_file, "name", key)
+
+    _bin_path(key).write_bytes(content)
+    _meta_path(key).write_text(
+        json.dumps(
+            {
+                "name": name,
+                "bytes": len(content),
+                "saved_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def cache_load_file(key: str):
+    """Load cached file from disk and return BytesFile or None."""
+    bp = _bin_path(key)
+    mp = _meta_path(key)
+    if not bp.exists():
+        return None
+
+    content = bp.read_bytes()
+    name = key
+    if mp.exists():
+        try:
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+            name = meta.get("name", key)
+        except Exception:
+            name = key
+    return BytesFile(content, name)
+
+
+def cache_meta(key: str) -> dict | None:
+    mp = _meta_path(key)
+    if not mp.exists():
+        return None
+    try:
+        return json.loads(mp.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def cache_clear(key: str) -> None:
+    bp = _bin_path(key)
+    mp = _meta_path(key)
+    if bp.exists():
+        bp.unlink()
+    if mp.exists():
+        mp.unlink()
+
+
+def resolve_file(key: str, uploaded_file):
+    """
+    Priority:
+      1) newly uploaded file
+      2) cached file on disk
+      3) None
+    """
+    if uploaded_file is not None:
+        cache_save_uploaded(key, uploaded_file)
+        return uploaded_file
+    return cache_load_file(key)
+
+
+# =========================
 # HELPERS
 # =========================
 def to_float(x) -> float:
@@ -81,8 +182,10 @@ def risk_decision(score: int) -> str:
     return "MANUAL_REVIEW"
 
 
-def read_summary_excel(uploaded_xlsx) -> pd.DataFrame:
-    return pd.read_excel(uploaded_xlsx, engine="openpyxl", header=None)
+def read_summary_excel(file_obj) -> pd.DataFrame:
+    # Read by bytes so it works for both UploadedFile and BytesFile
+    data = file_obj.getvalue()
+    return pd.read_excel(io.BytesIO(data), engine="openpyxl", header=None)
 
 
 def pill(text: str, kind: str):
@@ -113,12 +216,12 @@ def classify_game_type(lines_in_block: list[str]) -> str:
     return "UNKNOWN"
 
 
-def parse_games_csv(uploaded_file, known_player_ids: set[int]) -> pd.DataFrame:
-    if uploaded_file is None:
+def parse_games_csv(file_obj, known_player_ids: set[int]) -> pd.DataFrame:
+    if file_obj is None:
         return pd.DataFrame(columns=["game_id", "game_type", "player_id", "win", "fee"])
 
-    raw = uploaded_file.getvalue()
-    text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
+    raw = file_obj.getvalue()
+    text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
     lines = text.splitlines()
 
     rows = []
@@ -458,11 +561,11 @@ def structured_assessment(row, cop_ring, cop_tour, trf_ring, trf_tour, coverage)
 # =========================
 # LOAD + MERGE (2 WINDOWS)
 # =========================
-def load_excel_period(uploaded_excel) -> pd.DataFrame:
-    if uploaded_excel is None:
+def load_excel_period(file_obj) -> pd.DataFrame:
+    if file_obj is None:
         return pd.DataFrame(columns=["_player_id", "_net_total", "_net_ring", "_net_mtt", "_comm"])
 
-    x = read_summary_excel(uploaded_excel)
+    x = read_summary_excel(file_obj)
     x["_player_id"] = pd.to_numeric(x.iloc[:, IDX_ID], errors="coerce")
     x = x.dropna(subset=["_player_id"]).copy()
     x["_player_id"] = x["_player_id"].astype(int)
@@ -492,22 +595,70 @@ st.title(APP_TITLE)
 
 with st.sidebar:
     st.header("Загрузка данных (2 недели)")
+    st.caption("Файлы сохраняются на сервере и не пропадают при обновлении страницы, пока их не очистить вручную или не загрузить новые.")
 
     st.subheader("Окно 1: прошлая неделя")
-    excel_w1 = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker (прошлая неделя)", type=["xlsx"], key="excel_w1")
-    games_w1 = st.file_uploader("Игры (.csv) — выгрузка PPPoker (прошлая неделя)", type=["csv", "txt"], key="games_w1")
+    excel_w1_u = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker (прошлая неделя)", type=["xlsx"], key="excel_w1_u")
+    games_w1_u = st.file_uploader("Игры (.csv) — выгрузка PPPoker (прошлая неделя)", type=["csv", "txt"], key="games_w1_u")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Очистить Excel (окно 1)", use_container_width=True):
+            cache_clear("excel_w1")
+            st.rerun()
+    with col_b:
+        if st.button("Очистить Игры (окно 1)", use_container_width=True):
+            cache_clear("games_w1")
+            st.rerun()
 
     st.subheader("Окно 2: позапрошлая неделя")
-    excel_w2 = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker (позапрошлая неделя)", type=["xlsx"], key="excel_w2")
-    games_w2 = st.file_uploader("Игры (.csv) — выгрузка PPPoker (позапрошлая неделя)", type=["csv", "txt"], key="games_w2")
+    excel_w2_u = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker (позапрошлая неделя)", type=["xlsx"], key="excel_w2_u")
+    games_w2_u = st.file_uploader("Игры (.csv) — выгрузка PPPoker (позапрошлая неделя)", type=["csv", "txt"], key="games_w2_u")
+
+    col_c, col_d = st.columns(2)
+    with col_c:
+        if st.button("Очистить Excel (окно 2)", use_container_width=True):
+            cache_clear("excel_w2")
+            st.rerun()
+    with col_d:
+        if st.button("Очистить Игры (окно 2)", use_container_width=True):
+            cache_clear("games_w2")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Сохранённые файлы")
+
+    def show_cache_line(label: str, key: str):
+        meta = cache_meta(key)
+        if not meta:
+            st.write(f"- {label}: —")
+        else:
+            st.write(f"- {label}: {meta.get('name','file')} ({meta.get('bytes',0)} bytes), сохранено {meta.get('saved_at','')}".strip())
+
+    show_cache_line("Окно 1 Excel", "excel_w1")
+    show_cache_line("Окно 1 Игры", "games_w1")
+    show_cache_line("Окно 2 Excel", "excel_w2")
+    show_cache_line("Окно 2 Игры", "games_w2")
+
+    st.divider()
+    if st.button("Очистить ВСЁ сохранённое", type="secondary", use_container_width=True):
+        for k in ["excel_w1", "games_w1", "excel_w2", "games_w2"]:
+            cache_clear(k)
+        st.rerun()
 
     show_debug = st.checkbox("Показать технические детали", value=False)
 
+# Resolve effective files (upload first, otherwise cached)
+excel_w1 = resolve_file("excel_w1", excel_w1_u)
+games_w1 = resolve_file("games_w1", games_w1_u)
+excel_w2 = resolve_file("excel_w2", excel_w2_u)
+games_w2 = resolve_file("games_w2", games_w2_u)
+
 st.divider()
 
-# Minimal requirement: window 1 (Excel + Games)
+# Minimal requirement: window 1 must exist (uploaded or cached)
 if excel_w1 is None or games_w1 is None:
-    st.info("Загрузи как минимум файлы «прошлая неделя»: Excel + Игры. Окно 2 — дополнительно.")
+    st.info("Загрузи или восстанови из кэша файлы «окно 1: прошлая неделя» (Excel + Игры). Окно 2 — дополнительно.")
     st.stop()
 
 # Load + merge Excel (2 weeks)
@@ -564,7 +715,6 @@ if row_df.empty:
 
 row = row_df.iloc[0]
 
-# Coverage for player (combined games)
 target_games = games_df[games_df["player_id"] == int(target_id)] if not games_df.empty else pd.DataFrame()
 coverage = {
     "ring_games_with_target": int((target_games["game_type"] == "RING").sum()) if not target_games.empty else 0,
@@ -572,7 +722,6 @@ coverage = {
     "unknown_games_with_target": int((target_games["game_type"] == "UNKNOWN").sum()) if not target_games.empty else 0,
 }
 
-# Per-type analytics
 cop_ring = coplay_features(int(target_id), sessions_df, "RING")
 cop_tour = coplay_features(int(target_id), sessions_df, "TOURNAMENT")
 trf_ring = transfer_features(int(target_id), games_df, "RING")
@@ -582,7 +731,6 @@ score, decision, main_risk, blocks = structured_assessment(row, cop_ring, cop_to
 
 st.divider()
 
-# ======= RESULT HEADER =======
 h1, h2, h3 = st.columns([1.2, 1, 1], gap="small")
 with h1:
     st.subheader("Итог")
