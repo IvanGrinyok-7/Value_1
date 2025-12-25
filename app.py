@@ -1,17 +1,291 @@
+import io
 import re
+import json
 import hashlib
 import datetime as dt
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Optional dependency for persistent storage
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except Exception:
+    boto3 = None
+    ClientError = Exception
+
 
 # =========================
-# CONFIG / CONSTANTS
+# APP CONFIG
 # =========================
-APP_TITLE = "PPPoker: проверка риска вывода покерного клуба Value"
+APP_TITLE = "PPPoker: проверка риска вывода (2 недели)"
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
 
+
+# =========================
+# STORAGE (R2 preferred)
+# =========================
+DATA_PREFIX = "pppoker_shared/"
+META_KEY = DATA_PREFIX + "_meta.json"
+
+
+@dataclass
+class StoredUpload:
+    name: str
+    data: bytes
+    def getvalue(self):
+        return self.data
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.now()
+
+
+def _now_str() -> str:
+    return _now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_ts(s: str | None) -> dt.datetime | None:
+    if not s:
+        return None
+    try:
+        return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _md5(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
+
+
+class StorageBackend:
+    def enabled(self) -> bool:
+        return False
+
+    def load_bytes(self, key: str) -> bytes | None:
+        return None
+
+    def save_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
+        raise NotImplementedError
+
+    def delete(self, key: str) -> None:
+        raise NotImplementedError
+
+    def load_meta(self) -> dict:
+        raw = self.load_bytes(META_KEY)
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {}
+
+    def save_meta(self, meta: dict) -> None:
+        self.save_bytes(META_KEY, json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"), content_type="application/json")
+
+
+class R2Backend(StorageBackend):
+    def __init__(self):
+        self.ok = False
+        self.bucket = None
+        self.client = None
+
+        if boto3 is None:
+            return
+
+        # Streamlit Secrets expected:
+        # R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+        try:
+            endpoint = st.secrets["R2_ENDPOINT"]
+            access_key = st.secrets["R2_ACCESS_KEY_ID"]
+            secret_key = st.secrets["R2_SECRET_ACCESS_KEY"]
+            bucket = st.secrets["R2_BUCKET"]
+        except Exception:
+            return
+
+        try:
+            self.client = boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                region_name="auto",
+            )
+            self.bucket = bucket
+            # lightweight check
+            self.client.head_bucket(Bucket=self.bucket)
+            self.ok = True
+        except Exception:
+            self.ok = False
+
+    def enabled(self) -> bool:
+        return bool(self.ok)
+
+    def load_bytes(self, key: str) -> bytes | None:
+        if not self.ok:
+            return None
+        try:
+            r = self.client.get_object(Bucket=self.bucket, Key=key)
+            return r["Body"].read()
+        except ClientError:
+            return None
+        except Exception:
+            return None
+
+    def save_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
+        if not self.ok:
+            raise RuntimeError("R2 backend not configured")
+        extra = {}
+        if content_type:
+            extra["ContentType"] = content_type
+        self.client.put_object(Bucket=self.bucket, Key=key, Body=data, **extra)
+
+    def delete(self, key: str) -> None:
+        if not self.ok:
+            return
+        try:
+            self.client.delete_object(Bucket=self.bucket, Key=key)
+        except Exception:
+            pass
+
+
+class MemoryBackend(StorageBackend):
+    """
+    Фоллбек (без внешнего хранилища) — хранит только в st.session_state текущего пользователя.
+    Это НЕ общий режим и НЕ переживает reboot Community Cloud.
+    """
+    def __init__(self):
+        if "_mem_store" not in st.session_state:
+            st.session_state["_mem_store"] = {}
+
+    def enabled(self) -> bool:
+        return True
+
+    def load_bytes(self, key: str) -> bytes | None:
+        return st.session_state["_mem_store"].get(key)
+
+    def save_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
+        st.session_state["_mem_store"][key] = data
+
+    def delete(self, key: str) -> None:
+        if key in st.session_state["_mem_store"]:
+            del st.session_state["_mem_store"][key]
+
+
+def get_storage() -> StorageBackend:
+    r2 = R2Backend()
+    if r2.enabled():
+        return r2
+    return MemoryBackend()
+
+
+storage = get_storage()
+
+
+def is_stale_saved_at(saved_at_str: str | None) -> bool:
+    ts = _parse_ts(saved_at_str)
+    if ts is None:
+        return True
+    return _now().date() > ts.date()
+
+
+def load_shared_file(key_file: str) -> StoredUpload | None:
+    meta = storage.load_meta().get(key_file, {})
+    raw = storage.load_bytes(DATA_PREFIX + key_file)
+    if raw is None:
+        return None
+    return StoredUpload(name=meta.get("filename", key_file), data=raw)
+
+
+def save_shared_file(key_file: str, uploaded_file, label: str, uploaded_by: str):
+    data = uploaded_file.getvalue()
+    key = DATA_PREFIX + key_file
+
+    # content type (optional)
+    ct = None
+    low = key_file.lower()
+    if low.endswith(".json"):
+        ct = "application/json"
+    elif low.endswith(".csv"):
+        ct = "text/csv"
+    elif low.endswith(".xlsx"):
+        ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    storage.save_bytes(key, data, content_type=ct)
+
+    meta = storage.load_meta()
+    meta[key_file] = {
+        "label": label,
+        "filename": getattr(uploaded_file, "name", key_file),
+        "size_bytes": len(data),
+        "md5": _md5(data),
+        "saved_at": _now_str(),
+        "uploaded_by": (uploaded_by or "—").strip(),
+        "backend": storage.__class__.__name__,
+    }
+    storage.save_meta(meta)
+
+
+def delete_shared_file(key_file: str):
+    storage.delete(DATA_PREFIX + key_file)
+    meta = storage.load_meta()
+    if key_file in meta:
+        del meta[key_file]
+        storage.save_meta(meta)
+
+
+def delete_all_shared_files(keys: list[str]):
+    for k in keys:
+        delete_shared_file(k)
+
+
+def show_file_status(key_file: str):
+    meta = storage.load_meta().get(key_file)
+    if not meta:
+        st.caption("Сохранённого файла нет.")
+        st.error("Нет данных: нужно загрузить файл.")
+        return
+
+    saved_at = meta.get("saved_at")
+    who = meta.get("uploaded_by", "—")
+    fn = meta.get("filename", "—")
+    size_b = meta.get("size_bytes", "—")
+
+    st.caption(f"Сохранённый файл: {fn} | загружен: {saved_at} | кто: {who} | размер: {size_b} байт")
+
+    if is_stale_saved_at(saved_at):
+        st.error("Данные устарели: наступил новый день — нужно обновить выгрузку.")
+    else:
+        st.success("Данные актуальны на сегодня.")
+
+
+def shared_uploader(label: str, key_file: str, type_list: list[str], uploaded_by: str):
+    show_file_status(key_file)
+    uploaded = st.file_uploader(label, type=type_list, key=f"uploader_{key_file}")
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("Удалить файл", key=f"del_{key_file}"):
+            delete_shared_file(key_file)
+            st.rerun()
+    with c2:
+        st.caption("Если новый файл не загружать — будет использован сохранённый (общий для приглашённых пользователей).")
+
+    if uploaded is not None:
+        save_shared_file(key_file, uploaded, label, uploaded_by=uploaded_by)
+        st.success("Файл сохранён.")
+        st.rerun()
+
+    return load_shared_file(key_file)
+
+
+# =========================
+# ANALYTICS CORE
+# =========================
 def col_idx(col_letter: str) -> int:
     col_letter = col_letter.strip().upper()
     n = 0
@@ -20,85 +294,27 @@ def col_idx(col_letter: str) -> int:
     return n - 1
 
 
-# Excel columns (общая таблица)
-IDX_ID = col_idx("A")         # A - ID
-IDX_NET_TOTAL = col_idx("I")  # I - общий выигрыш
-IDX_NET_RING = col_idx("O")   # O - Ring Game
-IDX_NET_MTT = col_idx("P")    # P - MTT/SNG
-IDX_COMM = col_idx("AB")      # AB - комиссия
+IDX_ID = col_idx("A")
+IDX_NET_TOTAL = col_idx("I")
+IDX_NET_RING = col_idx("O")
+IDX_NET_MTT = col_idx("P")
+IDX_COMM = col_idx("AB")
 
-# Decision thresholds
 T_APPROVE = 25
 T_FAST_CHECK = 55
 
-# co-play thresholds
 MIN_SESSIONS_FOR_COPLAY = 6
 COPLAY_TOP1_SHARE_SUSP = 0.60
 COPLAY_TOP2_SHARE_SUSP = 0.80
 
-# transfer proxy thresholds
 PAIR_NET_TRANSFER_ALERT_RING = 25.0
 PAIR_NET_TRANSFER_ALERT_TOUR = 60.0
 PAIR_DOMINANCE_ALERT = 0.70
 
-# single-game extremes
 SINGLE_GAME_WIN_ALERT_RING = 60.0
 SINGLE_GAME_LOSS_ALERT_RING = 60.0
 SINGLE_GAME_WIN_ALERT_TOUR = 150.0
 SINGLE_GAME_LOSS_ALERT_TOUR = 150.0
-
-
-# =========================
-# HELPERS
-# =========================
-def now_local() -> dt.datetime:
-    # Простая логика: серверное время Streamlit (без tz).
-    return dt.datetime.now()
-
-
-def md5_bytes(b: bytes) -> str:
-    return hashlib.md5(b).hexdigest()
-
-
-def update_upload_state(state_prefix: str, uploaded_file):
-    """
-    Stores:
-      - <prefix>_hash
-      - <prefix>_ts (datetime)
-      - <prefix>_name
-    Updates timestamp only when file content hash changed.
-    """
-    h_key = f"{state_prefix}_hash"
-    ts_key = f"{state_prefix}_ts"
-    nm_key = f"{state_prefix}_name"
-
-    if uploaded_file is None:
-        return
-
-    content = uploaded_file.getvalue()
-    h = md5_bytes(content)
-    old = st.session_state.get(h_key)
-
-    if old != h:
-        st.session_state[h_key] = h
-        st.session_state[ts_key] = now_local()
-        st.session_state[nm_key] = getattr(uploaded_file, "name", "uploaded")
-
-
-def get_upload_ts(state_prefix: str):
-    return st.session_state.get(f"{state_prefix}_ts")
-
-
-def fmt_ts(ts) -> str:
-    if not ts:
-        return "—"
-    return ts.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def is_stale(ts: dt.datetime | None) -> bool:
-    if ts is None:
-        return True
-    return now_local().date() > ts.date()
 
 
 def to_float(x) -> float:
@@ -135,21 +351,11 @@ def risk_decision(score: int) -> str:
 
 
 def read_summary_excel(uploaded_xlsx) -> pd.DataFrame:
-    return pd.read_excel(uploaded_xlsx, engine="openpyxl", header=None)
+    if uploaded_xlsx is None:
+        return pd.DataFrame()
+    return pd.read_excel(io.BytesIO(uploaded_xlsx.getvalue()), engine="openpyxl", header=None)
 
 
-def pill(text: str, kind: str):
-    if kind == "ok":
-        st.success(text)
-    elif kind == "warn":
-        st.warning(text)
-    else:
-        st.error(text)
-
-
-# =========================
-# PARSE GAMES (TYPE-AWARE)
-# =========================
 GAME_ID_RE = re.compile(r"ID игры:\s*([0-9\-]+)", re.IGNORECASE)
 PLAYER_ROW_ID_RE = re.compile(r"(?:^|;)\s*(\d{6,10})\s*;", re.IGNORECASE)
 
@@ -171,7 +377,7 @@ def parse_games_csv(uploaded_file, known_player_ids: set[int]) -> pd.DataFrame:
         return pd.DataFrame(columns=["game_id", "game_type", "player_id", "win", "fee"])
 
     raw = uploaded_file.getvalue()
-    text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
+    text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
     lines = text.splitlines()
 
     rows = []
@@ -214,17 +420,15 @@ def parse_games_csv(uploaded_file, known_player_ids: set[int]) -> pd.DataFrame:
         win = np.nan
         fee = np.nan
 
-        # Tournament style
         if header_cols is not None and len(parts) == len(header_cols):
             if "Выигрыш" in header_cols:
                 win = to_float(parts[header_cols.index("Выигрыш")])
             if "Комиссия" in header_cols:
                 fee = to_float(parts[header_cols.index("Комиссия")])
         else:
-            # Ring fallback: ...;Раздачи;Выигрыш игрока;...
             if len(parts) >= 7:
                 win = to_float(parts[6])
-            # Fee fallback
+
             tail = parts[-6:] if len(parts) >= 6 else parts
             candidates = [to_float(t) for t in tail]
             candidates = [c for c in candidates if not np.isnan(c)]
@@ -257,9 +461,6 @@ def build_sessions_from_games(games_df: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
-# =========================
-# FEATURES
-# =========================
 def coplay_features(target_id: int, sessions_df: pd.DataFrame, game_type: str | None = None) -> dict:
     if sessions_df.empty or "players" not in sessions_df.columns:
         return {"sessions_count": 0, "unique_opponents": 0, "top1_coplay_share": 0.0, "top2_coplay_share": 0.0, "top_partners": []}
@@ -282,8 +483,10 @@ def coplay_features(target_id: int, sessions_df: pd.DataFrame, game_type: str | 
 
     partners = sorted(counter.items(), key=lambda x: x[1], reverse=True)
     unique_opponents = len(partners)
+
     top1 = partners[0][1] if len(partners) >= 1 else 0
     top2 = partners[1][1] if len(partners) >= 2 else 0
+
     top1_share = top1 / sessions_count if sessions_count else 0.0
     top2_share = (top1 + top2) / sessions_count if sessions_count else 0.0
 
@@ -344,6 +547,7 @@ def transfer_features(target_id: int, games_df: pd.DataFrame, game_type: str | N
 
     total_from_sources = float(sum(transfer.values()))
     sources_sorted = sorted(transfer.items(), key=lambda x: x[1], reverse=True)
+
     top_source_net = float(sources_sorted[0][1]) if sources_sorted else 0.0
     top_source_share = (top_source_net / total_from_sources) if total_from_sources > 0 else 0.0
 
@@ -357,13 +561,9 @@ def transfer_features(target_id: int, games_df: pd.DataFrame, game_type: str | N
     }
 
 
-# =========================
-# SCORING + OUTPUT
-# =========================
 def pick_main_risk(decision: str, sb_reasons: list[str], coverage: dict) -> str:
     if sb_reasons:
-        txt = sb_reasons[0].replace("RING:", "RING —").replace("TOURNAMENT:", "TOURNAMENT —")
-        return txt
+        return sb_reasons[0].replace("RING:", "RING —").replace("TOURNAMENT:", "TOURNAMENT —")
 
     if coverage["ring_games_with_target"] == 0 and coverage["tour_games_with_target"] == 0 and coverage["unknown_games_with_target"] == 0:
         return "Недостаточно данных по играм: по файлу «Игры» игрок не найден."
@@ -397,7 +597,6 @@ def structured_assessment(row, cop_ring, cop_tour, trf_ring, trf_tour, coverage)
         f"UNKNOWN: {coverage['unknown_games_with_target']}."
     )
 
-    # Excel
     if pd.notna(net_total):
         blocks["Профиль игрока (Excel)"].append(f"Общий выигрыш (I): {fmt_money(net_total)}.")
         if net_total > 0:
@@ -426,7 +625,6 @@ def structured_assessment(row, cop_ring, cop_tour, trf_ring, trf_tour, coverage)
             score += 15
             blocks["Профиль игрока (Excel)"].append("Профит в основном Ring — риск выше.")
 
-    # Co-play
     blocks["Сеть/поведение (co-play)"].append(
         f"RING: сессий={cop_ring['sessions_count']}, уникальных оппонентов={cop_ring['unique_opponents']}, "
         f"топ-1 доля={cop_ring['top1_coplay_share']:.0%}, топ-2 доля={cop_ring['top2_coplay_share']:.0%}."
@@ -452,7 +650,6 @@ def structured_assessment(row, cop_ring, cop_tour, trf_ring, trf_tour, coverage)
     else:
         blocks["Сеть/поведение (co-play)"].append("RING: данных по совместной игре мало/нет.")
 
-    # Transfer
     blocks["Перелив (transfer-proxy)"].append(
         f"RING: игр={trf_ring['target_games']}, суммарный результат={fmt_money(trf_ring['target_total_win_from_games'])}, "
         f"топ-источник={fmt_money(trf_ring['top_source_net'])}, доля={trf_ring['top_source_share']:.0%}."
@@ -508,14 +705,23 @@ def structured_assessment(row, cop_ring, cop_tour, trf_ring, trf_tour, coverage)
     return score, decision, main_risk, blocks
 
 
-# =========================
-# LOAD + MERGE (2 WINDOWS)
-# =========================
+def pill(text: str, kind: str):
+    if kind == "ok":
+        st.success(text)
+    elif kind == "warn":
+        st.warning(text)
+    else:
+        st.error(text)
+
+
 def load_excel_period(uploaded_excel) -> pd.DataFrame:
     if uploaded_excel is None:
         return pd.DataFrame(columns=["_player_id", "_net_total", "_net_ring", "_net_mtt", "_comm"])
 
     x = read_summary_excel(uploaded_excel)
+    if x is None or x.empty:
+        return pd.DataFrame(columns=["_player_id", "_net_total", "_net_ring", "_net_mtt", "_comm"])
+
     x["_player_id"] = pd.to_numeric(x.iloc[:, IDX_ID], errors="coerce")
     x = x.dropna(subset=["_player_id"]).copy()
     x["_player_id"] = x["_player_id"].astype(int)
@@ -533,95 +739,69 @@ def merge_excels(ex1: pd.DataFrame, ex2: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["_player_id", "_net_total", "_net_ring", "_net_mtt", "_comm"])
 
     both = pd.concat([ex1, ex2], ignore_index=True)
-    merged = (
-        both.groupby("_player_id", as_index=False)[["_net_total", "_net_ring", "_net_mtt", "_comm"]]
-        .sum(min_count=1)
-    )
+    merged = both.groupby("_player_id", as_index=False)[["_net_total", "_net_ring", "_net_mtt", "_comm"]].sum(min_count=1)
     return merged
 
 
 # =========================
-# UI
+# SIDEBAR: GLOBAL LOAD UI
 # =========================
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
+KEYS_ALL = ["excel_w1.xlsx", "games_w1.csv", "excel_w2.xlsx", "games_w2.csv"]
 
 with st.sidebar:
-    st.header("Загрузка данных (2 недели)")
+    st.header("Данные (общие для приглашённых пользователей)")
 
-    st.subheader("Окно 1: прошлая неделя")
-    excel_w1 = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker (прошлая неделя)", type=["xlsx"], key="excel_w1")
-    games_w1 = st.file_uploader("Игры (.csv) — выгрузка PPPoker (прошлая неделя)", type=["csv", "txt"], key="games_w1")
+    # storage backend indicator
+    if isinstance(storage, R2Backend) and storage.enabled():
+        st.success("Хранилище: Cloudflare R2 (данные переживают reboot).")
+    else:
+        st.warning("Хранилище: Memory fallback (общий режим и устойчивость НЕ гарантированы).")
 
-    st.subheader("Окно 2: позапрошлая неделя")
-    excel_w2 = st.file_uploader("Общая таблица (.xlsx) — выгрузка PPPoker (позапрошлая неделя)", type=["xlsx"], key="excel_w2")
-    games_w2 = st.file_uploader("Игры (.csv) — выгрузка PPPoker (позапрошлая неделя)", type=["csv", "txt"], key="games_w2")
+    uploaded_by = st.text_input("Оператор (кто загружает файлы)", value="", placeholder="например: SB / Admin / Ivan")
 
-    show_debug = st.checkbox("Показать технические детали", value=False)
+    st.subheader("Окно 1: прошлая неделя (обязательно)")
+    excel_w1 = shared_uploader("Общая таблица (.xlsx) — прошлая неделя", "excel_w1.xlsx", ["xlsx"], uploaded_by)
+    games_w1 = shared_uploader("Игры (.csv) — прошлая неделя", "games_w1.csv", ["csv", "txt"], uploaded_by)
 
-    # фиксируем timestamps при смене файлов
-    update_upload_state("excel_w1", excel_w1)
-    update_upload_state("games_w1", games_w1)
-    update_upload_state("excel_w2", excel_w2)
-    update_upload_state("games_w2", games_w2)
+    st.subheader("Окно 2: позапрошлая неделя (дополнительно)")
+    excel_w2 = shared_uploader("Общая таблица (.xlsx) — позапрошлая неделя", "excel_w2.xlsx", ["xlsx"], uploaded_by)
+    games_w2 = shared_uploader("Игры (.csv) — позапрошлая неделя", "games_w2.csv", ["csv", "txt"], uploaded_by)
 
     st.divider()
-    st.subheader("Актуальность данных")
+    if st.button("Удалить ВСЕ данные (2 окна)", type="secondary"):
+        delete_all_shared_files(KEYS_ALL)
+        st.rerun()
 
-    ts_excel_w1 = get_upload_ts("excel_w1")
-    ts_games_w1 = get_upload_ts("games_w1")
-    ts_excel_w2 = get_upload_ts("excel_w2")
-    ts_games_w2 = get_upload_ts("games_w2")
-
-    st.write(f"Прошлая неделя: Excel загружен: {fmt_ts(ts_excel_w1)}")
-    st.write(f"Прошлая неделя: Игры загружены: {fmt_ts(ts_games_w1)}")
-    st.write(f"Позапрошлая неделя: Excel загружен: {fmt_ts(ts_excel_w2)}")
-    st.write(f"Позапрошлая неделя: Игры загружены: {fmt_ts(ts_games_w2)}")
-
-    # Индикатор "наступил новый день -> обновить"
-    stale_required = is_stale(ts_excel_w1) or is_stale(ts_games_w1)
-    stale_optional = (excel_w2 is not None or games_w2 is not None) and (is_stale(ts_excel_w2) or is_stale(ts_games_w2))
-
-    if stale_required:
-        st.error("Данные (прошлая неделя) устарели: наступил новый день — нужно обновить выгрузки.")
-    else:
-        st.success("Данные (прошлая неделя) актуальны на сегодня.")
-
-    if excel_w2 is not None or games_w2 is not None:
-        if stale_optional:
-            st.warning("Данные (позапрошлая неделя) устарели: рекомендуется обновить, если используешь окно 2.")
-        else:
-            st.success("Данные (позапрошлая неделя) актуальны на сегодня.")
-
-    if st.button("Сбросить отметки времени (только индикатор)", type="secondary"):
-        for k in ["excel_w1_ts", "games_w1_ts", "excel_w2_ts", "games_w2_ts"]:
-            if k in st.session_state:
-                del st.session_state[k]
+    show_debug = st.checkbox("Показать технические детали", value=False)
 
 
 st.divider()
 
-# Минимально обязательны: окно 1 (и Excel, и Games)
 if excel_w1 is None or games_w1 is None:
-    st.info("Загрузи как минимум файлы «прошлая неделя»: Excel + Игры. Окно 2 — дополнительно.")
+    st.info("Нужно загрузить файлы окна 1: Excel + Игры.")
     st.stop()
 
-# Load + merge Excel (2 weeks)
+if (excel_w2 is None) ^ (games_w2 is None):
+    st.warning("Окно 2 загружено неполностью (есть только один файл). Для корректной суммы лучше загрузить оба.")
+
+# =========================
+# LOAD + MERGE 2 WINDOWS
+# =========================
 ex1 = load_excel_period(excel_w1)
 ex2 = load_excel_period(excel_w2) if excel_w2 is not None else pd.DataFrame(columns=ex1.columns)
-
 df = merge_excels(ex1, ex2)
 
 known_ids = set(df["_player_id"].tolist())
 
-# Parse + merge games (2 weeks)
 g1 = parse_games_csv(games_w1, known_ids)
 g2 = parse_games_csv(games_w2, known_ids) if games_w2 is not None else pd.DataFrame(columns=g1.columns)
 games_df = pd.concat([g1, g2], ignore_index=True)
 
 sessions_df = build_sessions_from_games(games_df)
 
-# Top status bar
+# =========================
+# TOP STATUS
+# =========================
 c1, c2, c3, c4 = st.columns(4, gap="small")
 c1.metric("Игроков (сумма 2 недель)", f"{len(df)}", border=True)
 c2.metric("Строк games (сумма 2 недель)", f"{len(games_df)}", border=True)
@@ -634,20 +814,23 @@ else:
 
 st.divider()
 
+# =========================
+# PLAYER CHECK UI
+# =========================
 left, right = st.columns([1, 2], gap="large")
 with left:
     st.subheader("Проверка игрока")
     default_id = int(df["_player_id"].iloc[0]) if len(df) else 0
     target_id = st.number_input("ID игрока на вывод", min_value=0, value=default_id, step=1)
     run = st.button("Проверить", type="primary")
-    st.caption("Аналитика считается по сумме 2 недель (если загружено окно 2).")
+    st.caption("Аналитика по сумме окна 1 + окна 2 (если загружено).")
 
 with right:
-    st.subheader("Краткая инструкция")
+    st.subheader("Как читать решение")
     st.markdown(
-        "- Окно 1 (прошлая неделя) — **обязательно**.\n"
-        "- Окно 2 (позапрошлая неделя) — **дополнительно**, улучшает точность.\n"
-        "- Нажми «Проверить»: увидишь **главный риск** + причины."
+        "- APPROVE — можно разрешить.\n"
+        "- FAST_CHECK — быстрая проверка.\n"
+        "- MANUAL_REVIEW — ручная проверка СБ."
     )
 
 if not run:
@@ -660,7 +843,6 @@ if row_df.empty:
 
 row = row_df.iloc[0]
 
-# Coverage for player (combined games)
 target_games = games_df[games_df["player_id"] == int(target_id)] if not games_df.empty else pd.DataFrame()
 coverage = {
     "ring_games_with_target": int((target_games["game_type"] == "RING").sum()) if not target_games.empty else 0,
@@ -668,7 +850,6 @@ coverage = {
     "unknown_games_with_target": int((target_games["game_type"] == "UNKNOWN").sum()) if not target_games.empty else 0,
 }
 
-# Per-type analytics
 cop_ring = coplay_features(int(target_id), sessions_df, "RING")
 cop_tour = coplay_features(int(target_id), sessions_df, "TOURNAMENT")
 trf_ring = transfer_features(int(target_id), games_df, "RING")
@@ -678,12 +859,14 @@ score, decision, main_risk, blocks = structured_assessment(row, cop_ring, cop_to
 
 st.divider()
 
-# ======= RESULT HEADER =======
+# =========================
+# RESULT
+# =========================
 h1, h2, h3 = st.columns([1.2, 1, 1], gap="small")
 with h1:
     st.subheader("Итог")
-h2.metric("Risk score", f"{score}/100", border=True, help="0 = низкий риск, 100 = высокий риск.")
-h3.metric("Decision", decision, border=True, help="APPROVE / FAST_CHECK / MANUAL_REVIEW")
+h2.metric("Risk score", f"{score}/100", border=True)
+h3.metric("Decision", decision, border=True)
 
 if decision == "APPROVE":
     pill("ВЫВОД: РАЗРЕШИТЬ", "ok")
@@ -696,48 +879,31 @@ tab1, tab2, tab3 = st.tabs(["Кратко", "Детали", "Пары / исто
 
 with tab1:
     st.subheader("Главный риск")
-    st.info(f"**Главный риск:** {main_risk}")
+    st.info(f"Главный риск: {main_risk}")
 
-    st.subheader("Ключевой вывод")
-    for x in blocks["Ключевой вывод"]:
-        st.markdown(f"- {x}")
-
-    st.subheader("Причины (самое важное)")
+    st.subheader("Причины")
     if blocks["Причины для ручной проверки СБ"]:
-        for x in blocks["Причины для ручной проверки СБ"][:8]:
+        for x in blocks["Причины для ручной проверки СБ"][:12]:
             st.markdown(f"- {x}")
     else:
-        st.markdown("- Явных причин для ручной проверки СБ по текущим данным не выявлено.")
+        st.markdown("- Явных причин для ручной проверки СБ не выявлено.")
 
-    st.subheader("Покрытие данных (2 недели)")
+    st.subheader("Покрытие данных")
     for x in blocks["Покрытие данных"]:
         st.markdown(f"- {x}")
 
 with tab2:
-    st.subheader("Профиль игрока (сумма 2 недель)")
+    st.subheader("Excel")
     for x in blocks["Профиль игрока (Excel)"]:
         st.markdown(f"- {x}")
 
-    st.subheader("Сеть/поведение (co-play)")
+    st.subheader("Co-play")
     for x in blocks["Сеть/поведение (co-play)"]:
         st.markdown(f"- {x}")
 
-    st.subheader("Перелив (transfer-proxy)")
+    st.subheader("Transfer-proxy")
     for x in blocks["Перелив (transfer-proxy)"]:
         st.markdown(f"- {x}")
-
-    with st.expander("Показать цифры (подробно)", expanded=False):
-        a, b, c, d = st.columns(4, gap="small")
-        a.metric("Excel: общий выигрыш (I)", fmt_money(row["_net_total"]), border=True)
-        b.metric("Excel: Ring (O)", fmt_money(row["_net_ring"]), border=True)
-        c.metric("Excel: MTT/SNG (P)", fmt_money(row["_net_mtt"]), border=True)
-        d.metric("Excel: комиссия (AB)", fmt_money(row["_comm"]), border=True)
-
-        st.write("RING co-play:", cop_ring)
-        st.write("TOURNAMENT co-play:", cop_tour)
-
-        st.write("RING transfer:", {k: trf_ring[k] for k in ["target_games", "target_total_win_from_games", "top_source_net", "top_source_share"]})
-        st.write("TOURNAMENT transfer:", {k: trf_tour[k] for k in ["target_games", "target_total_win_from_games", "top_source_net", "top_source_share"]})
 
 with tab3:
     st.subheader("Co-play партнёры (RING)")
@@ -746,29 +912,22 @@ with tab3:
     else:
         st.info("Нет данных по партнёрам в RING.")
 
-    st.subheader("Co-play партнёры (TOURNAMENT)")
-    if cop_tour["top_partners"]:
-        st.dataframe(pd.DataFrame(cop_tour["top_partners"], columns=["partner_id", "coplay_sessions"]), use_container_width=True)
-    else:
-        st.info("Нет данных по партнёрам в TOURNAMENT.")
-
     st.subheader("Источники transfer-proxy (RING)")
     if trf_ring["top_sources"]:
         st.dataframe(pd.DataFrame(trf_ring["top_sources"], columns=["source_player_id", "estimated_transfer_to_target"]), use_container_width=True)
     else:
-        st.info("Нет выраженных источников в RING (по текущим данным/окну).")
+        st.info("Нет выраженных источников в RING.")
 
     st.subheader("Источники transfer-proxy (TOURNAMENT)")
     if trf_tour["top_sources"]:
         st.dataframe(pd.DataFrame(trf_tour["top_sources"], columns=["source_player_id", "estimated_transfer_to_target"]), use_container_width=True)
     else:
-        st.info("Нет выраженных источников в TOURNAMENT (по текущим данным/окну).")
+        st.info("Нет выраженных источников в TOURNAMENT.")
 
 if show_debug:
-    with st.expander("Debug: сырые таблицы (Excel/Games/Sessions)", expanded=False):
-        st.write("Excel (merged) head:")
-        st.dataframe(df.head(50), use_container_width=True)
-        st.write("games_df head:")
-        st.dataframe(games_df.head(50), use_container_width=True)
-        st.write("sessions_df head:")
-        st.dataframe(sessions_df.head(50), use_container_width=True)
+    with st.expander("Debug: данные", expanded=False):
+        st.write("Storage backend:", storage.__class__.__name__)
+        st.write("Meta:", storage.load_meta())
+        st.dataframe(df.head(30), use_container_width=True)
+        st.dataframe(games_df.head(30), use_container_width=True)
+        st.dataframe(sessions_df.head(30), use_container_width=True)
