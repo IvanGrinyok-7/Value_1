@@ -1388,7 +1388,7 @@ st.title(APP_TITLE)
 
 with st.sidebar:
     st.header("Файлы")
-    st.caption("Загрузи 2 файла: 'Общее' (DB) и 'Игры' (export PPPoker).")
+    st.caption("Загрузи 2 файла: 'Общеие данные' и 'Игры' (export PPPoker).")
 
     db_up = st.file_uploader("1) Общие данные (Excel/CSV)", type=["xlsx", "xls", "csv"], key="db_uploader")
     games_up = st.file_uploader("2) Игры (TXT/CSV export)", type=["txt", "csv"], key="games_uploader")
