@@ -962,24 +962,24 @@ def score_player(
 
     if j_tot <= 0:
         score += 5
-        reasons.append("DB: по сумме J игрок в минусе — как 'получатель перелива' менее вероятен.")
+        reasons.append("Общие данные: по сумме J игрок в минусе — как 'получатель перелива' менее вероятен.")
     else:
         score += 18
-        reasons.append("DB: по сумме J игрок в плюсе — требуется контроль (плюсовые чаще попадают в перелив).")
+        reasons.append("Общие данные: по сумме J игрок в плюсе — требуется контроль (плюсовые чаще попадают в перелив).")
 
     if j_tot > 0 and abs(events_delta) >= max(10.0, 0.25 * abs(j_tot)):
         score += 8
-        reasons.append("DB: большая разница J и O — существенная доля 'событий' (джекпоты/эквити/прочее).")
+        reasons.append("Общие данные: большая разница J и O — существенная доля 'событий' (джекпоты/эквити/прочее).")
 
     if weeks_cnt >= 2 and pd.notna(top_week_share) and float(top_week_share) >= 0.60:
         score += 8
-        reasons.append("DB: прибыль концентрируется в одной неделе — нестабильный профиль.")
+        reasons.append("Общие данные: прибыль концентрируется в одной неделе — нестабильный профиль.")
 
     ring_over_comm_ppsr = db_sum.get("ring_over_comm_ppsr", np.nan)
     p_ring = float(db_sum.get("p_ring", 0.0) or 0.0)
     if pd.notna(ring_over_comm_ppsr) and float(ring_over_comm_ppsr) >= 8 and abs(p_ring) >= 80:
         score += 8
-        reasons.append("DB: Ring-профит слишком высок относительно PPSR комиссии — требуется проверка источника.")
+        reasons.append("Общие данные: Ring-профит слишком высок относительно PPSR комиссии — требуется проверка источника.")
 
     # --- Coverage
     ring_games = int(coverage.get("ring_games", 0))
@@ -1102,7 +1102,7 @@ def score_player(
         bonus, txt = agent_match_bonus(db_df, int(partner), int(db_sum["meta"]["player_id"]))
         if bonus > 0 and txt:
             score += bonus
-            reasons.append(f"DB: усилитель риска — {txt}")
+            reasons.append(f"Общие данные: усилитель риска — {txt}")
 
         # add short context line (manager-readable)
         if label == "RING":
@@ -1303,12 +1303,12 @@ def build_security_message(pid: int, decision: str, score: int, weeks_mode: str,
     msg.append(f"Решение системы: {decision} / Risk score: {score}/100")
     msg.append(f"Период: {period_str}")
     msg.append("")
-    msg.append("DB (период):")
+    msg.append("Общие данные (период):")
     msg.append(f"- J (итог + события): {signals.get('db_j_total', 0.0):.2f}")
     msg.append(f"- Ring: {signals.get('db_p_ring', 0.0):.2f}; MTT/SNG: {signals.get('db_p_mtt', 0.0):.2f}")
     msg.append(f"- J - O (влияние событий): {signals.get('db_events_delta', 0.0):.2f}")
     msg.append("")
-    msg.append("Games (покрытие):")
+    msg.append("Игры (покрытие):")
     msg.append(f"- Ring игр: {signals.get('coverage_ring_games', 0)}, Tour игр: {signals.get('coverage_tour_games', 0)}")
     msg.append(f"- Ring co-play: сессий {signals.get('coplay_ring_sessions', 0)}, топ-2 доля {signals.get('coplay_ring_top2_share', 0.0)*100:.0f}%")
     msg.append("")
@@ -1390,8 +1390,8 @@ with st.sidebar:
     st.header("Файлы")
     st.caption("Загрузи 2 файла: 'Общее' (DB) и 'Игры' (export PPPoker).")
 
-    db_up = st.file_uploader("1) DB (Excel/CSV)", type=["xlsx", "xls", "csv"], key="db_uploader")
-    games_up = st.file_uploader("2) Games (TXT/CSV export)", type=["txt", "csv"], key="games_uploader")
+    db_up = st.file_uploader("1) Общие данные (Excel/CSV)", type=["xlsx", "xls", "csv"], key="db_uploader")
+    games_up = st.file_uploader("2) Игры (TXT/CSV export)", type=["txt", "csv"], key="games_uploader")
 
     c1, c2, c3 = st.columns(3)
     if c1.button("Очистить DB", use_container_width=True):
@@ -1414,7 +1414,7 @@ with st.sidebar:
     last_n = st.number_input("N (если выбран режим 'Последние N недель')", min_value=1, value=4, step=1)
 
 if db_file is None:
-    st.info("Загрузи DB файл, чтобы начать проверку.")
+    st.info("Загрузи общий файл, чтобы начать проверку.")
     st.stop()
 
 # Load DB
@@ -1447,10 +1447,10 @@ if games_file is not None:
 
 # Top metrics
 m1, m2, m3, m4 = st.columns(4, gap="small")
-m1.metric("DB: строк", f"{len(db_df)}", border=True)
-m2.metric("DB: игроков", f"{db_df['_player_id'].nunique()}", border=True)
+m1.metric("Общие данные: строк", f"{len(db_df)}", border=True)
+m2.metric("Общие данные: игроков", f"{db_df['_player_id'].nunique()}", border=True)
 m3.metric("Games: строк", f"{len(games_df)}", border=True)
-m4.metric("Pair flows", f"{len(flows_df)}", border=True)
+m4.metric("Парные потоки", f"{len(flows_df)}", border=True)
 
 st.divider()
 
@@ -1478,7 +1478,7 @@ with tab_check:
 
     db_sum, by_week = db_summary_for_player(db_period, int(pid))
     if db_sum is None:
-        st.error("Игрок не найден в DB за выбранный период.")
+        st.error("Игрок не найден в общем файле за выбранный период.")
         st.stop()
 
     ring_s = idx.get("player_game_series", {}).get(("RING", int(pid)))
@@ -1564,7 +1564,7 @@ with tab_check:
 
     cov_total = signals["coverage_ring_games"] + signals["coverage_tour_games"]
     if cov_total == 0:
-        render_signal_row("Покрытие по играм", "0 игр (по Games нельзя подтвердить/опровергнуть)", "warn")
+        render_signal_row("Покрытие по играм", "0 игр (по Играм нельзя подтвердить/опровергнуть)", "warn")
     else:
         render_signal_row("Покрытие по играм", f"Ring: {signals['coverage_ring_games']}, Tour: {signals['coverage_tour_games']}", "ok")
 
@@ -1604,7 +1604,7 @@ with tab_check:
     # --- Details tabs
     st.divider()
     details_tab, db_tab, games_tab, partners_tab = st.tabs(
-        ["Объяснение (почему так)", "DB (финансы)", "Games (сговор/перелив)", "Детали пары"]
+        ["Объяснение (почему так)", "Общие данные (операции)", "Игры (сговор/перелив)", "Детали пары"]
     )
 
     with details_tab:
@@ -1615,14 +1615,14 @@ with tab_check:
 
     with db_tab:
         meta = db_sum.get("meta", {})
-        st.subheader("Профиль игрока (из DB)")
+        st.subheader("Профиль игрока (из общих данных)")
         c1, c2, c3, c4 = st.columns(4, gap="small")
         c1.metric("ID", str(meta.get("player_id", "")), border=True)
         c2.metric("Ник", str(meta.get("nick", ""))[:30], border=True)
         c3.metric("Игровое имя", str(meta.get("ign", ""))[:30], border=True)
         c4.metric("Страна/регион", str(meta.get("country", ""))[:30], border=True)
 
-        st.subheader("Финансы за период")
+        st.subheader("Операции за период")
         d1, d2, d3, d4 = st.columns(4, gap="small")
         d1.metric("J (итог + события)", fmt_money(signals["db_j_total"]), border=True)
         d2.metric("Ring", fmt_money(signals["db_p_ring"]), border=True)
