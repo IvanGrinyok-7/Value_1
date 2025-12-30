@@ -13,7 +13,7 @@ import streamlit.components.v1 as components
 # =========================
 # CONFIG
 # =========================
-APP_TITLE = "PPPoker Anti-Fraud — проверка игрока (v2.0 исправленная)"
+APP_TITLE = "PPPoker | аналитика рисков — проверка игроков клуба Value"
 CACHE_DIR = Path(".pppoker_app_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
@@ -1388,7 +1388,7 @@ st.title(APP_TITLE)
 
 with st.sidebar:
     st.header("Файлы")
-    st.caption("Загрузи 2 файла: 'Общеие данные' и 'Игры' (export PPPoker).")
+    st.caption("Загрузи 2 файла: 'Общие данные' и 'Игры' (export PPPoker).")
 
     db_up = st.file_uploader("1) Общие данные (Excel/CSV)", type=["xlsx", "xls", "csv"], key="db_uploader")
     games_up = st.file_uploader("2) Игры (TXT/CSV export)", type=["txt", "csv"], key="games_uploader")
