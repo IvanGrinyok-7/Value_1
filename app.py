@@ -3,464 +3,449 @@ import pandas as pd
 import numpy as np
 import re
 import io
-import datetime
-from collections import defaultdict
 
 # ==========================================
-# 1. КОНФИГУРАЦИЯ И КОНСТАНТЫ
+# 1. НАСТРОЙКИ И КОНСТАНТЫ
 # ==========================================
-st.set_page_config(page_title="PPPoker Anti-Fraud Analytics", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="PPPoker Analyzer Pro", layout="wide", page_icon="⚡")
 
-# Пороги срабатывания (Risk Thresholds)
-RISK_HIGH_NET_FLOW_BB = 40.0      # Если выиграл у одного игрока > 40 ББ (чистыми)
-RISK_HIGH_GROSS_FLOW_BB = 150.0   # Если оборот с одним игроком > 150 ББ
-RISK_CONCENTRATION = 0.75         # Если > 75% выигрыша получено от одного оппонента
-RISK_HU_SHARE = 0.80              # Если > 80% профита получено в HU ситуациях
-RISK_LOW_RAKE_RATIO = 0.03        # Если комиссия < 3% от выигрыша (для Ring)
+# Пороги риска (Risk Thresholds)
+RISK_NET_BB = 40.0        # Чистый выигрыш у одного игрока > 40 BB
+RISK_GROSS_BB = 150.0     # Оборот с одним игроком > 150 BB
+RISK_CONCENTRATION = 0.70 # > 70% профита от одного донора
+RISK_HU_SHARE = 0.80      # > 80% профита в HU
+RISK_LOW_RAKE = 0.035     # Рейк < 3.5% (признак дампа без постфлопа)
 
-# Регулярки для парсинга
+# Регулярные выражения (компилируем один раз)
 RE_GAME_ID = re.compile(r"ID игры:\s*([0-9\.\-eE]+(?:-[0-9]+)?)", re.IGNORECASE)
 RE_TABLE_NAME = re.compile(r"Название стола:\s*(.+?)\s*$", re.IGNORECASE)
-RE_STAKES = re.compile(r"(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)") # Находит 0.1/0.2 и т.д.
+RE_STAKES = re.compile(r"(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)")
 
 # ==========================================
-# 2. ПАРСИНГ И ЗАГРУЗКА ДАННЫХ
+# 2. ОПТИМИЗИРОВАННЫЙ ПАРСИНГ
 # ==========================================
 
-def clean_float(x):
-    """Превращает строки с запятыми и пробелами в float."""
+def fast_clean_float(x):
+    """Быстрая очистка чисел."""
     if pd.isna(x) or x == "":
         return 0.0
-    s = str(x).replace(",", ".").replace("\xa0", "").replace(" ", "").strip()
+    # Если это уже число
+    if isinstance(x, (int, float)):
+        return float(x)
+    # Быстрая замена
     try:
-        return float(s)
+        return float(str(x).replace(",", ".").replace("\xa0", "").strip())
     except:
         return 0.0
 
 @st.cache_data(show_spinner=False)
-def parse_games_file(uploaded_files):
+def parse_games_optimized(uploaded_files):
     """
-    Сложный парсер для специфического формата CSV/TXT из PPPoker.
-    Преобразует вложенную структуру в плоскую таблицу.
+    Сверхбыстрый парсер логов игр.
     """
-    all_rows = []
+    data_rows = []
     
     for file in uploaded_files:
-        # Читаем как байты, декодируем, чтобы не зависеть от BOM и кодировок
+        # Читаем сразу весь файл в память (быстрее, чем line-by-line для таких объемов)
         content = file.getvalue().decode("utf-8", errors="ignore")
         lines = content.splitlines()
         
-        current_game_id = None
-        current_table = ""
-        current_bb = 0.0
-        current_game_type = "UNKNOWN" # RING / MTT / SNG
-        current_date = None
+        # Переменные контекста
+        curr_gid = None
+        curr_table = "Unknown"
+        curr_bb = 0.0
+        curr_type = "UNKNOWN"
         
-        # Индексы колонок (динамический поиск)
-        idx_map = {}
+        # Карта индексов колонок (динамическая)
+        idx = {}
         
         for line in lines:
-            line = line.strip()
-            if not line: 
-                continue
-                
-            # 1. Поиск ID игры (Начало блока)
-            m_id = RE_GAME_ID.search(line)
-            if m_id:
-                current_game_id = m_id.group(1)
-                
-                # Ищем название стола в той же строке
-                m_table = RE_TABLE_NAME.search(line)
-                current_table = m_table.group(1) if m_table else "Unknown Table"
-                
-                # Сброс параметров блока
-                current_bb = 0.0
-                current_game_type = "UNKNOWN"
-                idx_map = {}
-                continue
-                
-            # 2. Поиск даты (если есть в блоке)
-            if "Начало:" in line and "Окончание:" in line:
-                # Можно парсить дату, если нужно для таймлайна
-                pass
-
-            # 3. Определение типа игры и ставок
-            # Если строка содержит ставки типа "0.5/1", это Ring
-            m_stakes = RE_STAKES.search(line)
-            if m_stakes and "Бай-ин:" not in line: # Исключаем турниры где бай-ин может быть похож
-                try:
-                    current_bb = float(m_stakes.group(2).replace(",", "."))
-                    current_game_type = "RING"
-                except:
-                    pass
+            # Быстрый фильтр пустых строк
+            if len(line) < 5: continue
             
-            if "PPST" in line or "Бай-ин:" in line or "Гарант." in line:
-                current_game_type = "TOURNAMENT"
-
-            # 4. Поиск заголовка таблицы игроков
-            # Строка вида: ;ID игрока;Ник;...
-            if "ID игрока" in line:
-                parts = [p.strip().strip('"') for p in line.split(";")]
-                # Создаем карту индексов, так как порядок может меняться
-                for i, col in enumerate(parts):
-                    if "ID игрока" in col: idx_map['id'] = i
-                    elif "Ник" in col: idx_map['nick'] = i
-                    elif "Выигрыш" in col: idx_map['win'] = i
-                    elif "Комиссия" in col: idx_map['rake'] = i
-                    elif "Бай-ин" in col and "PP" in col: idx_map['buyin'] = i
+            # 1. Поиск ID игры (маркер блока)
+            if "ID игры:" in line:
+                m = RE_GAME_ID.search(line)
+                if m:
+                    curr_gid = m.group(1)
+                    
+                    # Название стола
+                    t_match = RE_TABLE_NAME.search(line)
+                    curr_table = t_match.group(1) if t_match else "Unknown"
+                    
+                    # Сброс
+                    curr_bb = 0.0
+                    curr_type = "UNKNOWN"
+                    idx = {}
+                continue
+                
+            # 2. Определение типа и ставок
+            if curr_gid and ("PPSR" in line or "PPST" in line or "/" in line):
+                if "PPST" in line or "Бай-ин" in line:
+                    curr_type = "MTT/SNG"
+                else:
+                    # Пытаемся найти ставки для Ring
+                    s_match = RE_STAKES.search(line)
+                    if s_match:
+                        try:
+                            curr_bb = float(s_match.group(2).replace(",", "."))
+                            curr_type = "RING"
+                        except: pass
                 continue
 
-            # 5. Парсинг строки игрока
-            # Строка данных начинается с ; (пустой первый элемент при split)
-            if current_game_id and idx_map and "Итог" not in line:
-                parts = [p.strip().strip('"') for p in line.split(";")]
-                
-                # Проверка: строка должна содержать данные (длина больше макс индекса)
-                max_idx = max(idx_map.values()) if idx_map else 0
-                if len(parts) <= max_idx:
+            # 3. Хедер таблицы
+            if ";ID игрока;" in line:
+                parts = [p.strip().replace('"', '') for p in line.split(";")]
+                for i, col in enumerate(parts):
+                    if "ID игрока" in col: idx['id'] = i
+                    elif "Ник" in col: idx['nick'] = i
+                    elif "Выигрыш" in col: idx['win'] = i
+                    elif "Комиссия" in col: idx['rake'] = i
+                continue
+
+            # 4. Строка данных (должен быть активный game_id и карта индексов)
+            if curr_gid and idx and ";Итог;" not in line:
+                parts = line.split(";")
+                # Простейшая валидация длины
+                if len(parts) < max(idx.values(), default=0): 
                     continue
                 
                 try:
-                    p_id_str = parts[idx_map['id']]
-                    if not p_id_str.isdigit(): continue # Пропуск мусорных строк
+                    p_id_raw = parts[idx['id']].strip().replace('"', '')
+                    if not p_id_raw.isdigit(): continue
                     
-                    p_id = int(p_id_str)
-                    p_nick = parts[idx_map.get('nick', -1)] if 'nick' in idx_map else ""
-                    p_win = clean_float(parts[idx_map.get('win', -1)])
-                    p_rake = clean_float(parts[idx_map.get('rake', -1)])
+                    p_win = fast_clean_float(parts[idx['win']])
+                    p_rake = fast_clean_float(parts[idx.get('rake', -1)])
                     
-                    all_rows.append({
-                        'game_id': current_game_id,
-                        'table_name': current_table,
-                        'game_type': current_game_type,
-                        'bb': current_bb,
-                        'player_id': p_id,
-                        'nick': p_nick,
-                        'win': p_win,
-                        'rake': p_rake
-                    })
-                except Exception:
+                    data_rows.append((
+                        curr_gid, 
+                        curr_type, 
+                        curr_bb, 
+                        int(p_id_raw), 
+                        parts[idx.get('nick', -1)].strip().replace('"', ''), 
+                        p_win, 
+                        p_rake
+                    ))
+                except:
                     continue
 
-    return pd.DataFrame(all_rows)
+    if not data_rows:
+        return pd.DataFrame()
+
+    # Создание DF с оптимизированными типами данных
+    df = pd.DataFrame(data_rows, columns=['game_id', 'type', 'bb', 'player_id', 'nick', 'win', 'rake'])
+    df['type'] = df['type'].astype('category')
+    df['player_id'] = df['player_id'].astype('int32')
+    df['win'] = df['win'].astype('float32')
+    df['rake'] = df['rake'].astype('float32')
+    df['bb'] = df['bb'].astype('float32')
+    return df
 
 @st.cache_data(show_spinner=False)
-def load_general_files(uploaded_files):
-    """Загружает файлы 'Общее.csv'."""
+def load_general_data(uploaded_files):
+    """Загрузка файла 'Общее'."""
     dfs = []
+    target_cols = ['ID игрока', 'Ник', 'Общий выигрыш игроков + События', 'Выигрыш игрока Ring Game', 'Выигрыш игрока MTT, SNG']
+    
     for f in uploaded_files:
         try:
             if f.name.endswith('.xlsx'):
                 df = pd.read_excel(f)
             else:
-                # Авто-детект разделителя
+                # Пробуем разные разделители
                 content = f.getvalue()
                 try:
                     df = pd.read_csv(io.BytesIO(content), sep=';', encoding='utf-8')
                 except:
                     df = pd.read_csv(io.BytesIO(content), sep=',', encoding='utf-8')
-            dfs.append(df)
-        except Exception as e:
-            st.error(f"Ошибка чтения файла {f.name}: {e}")
             
-    if not dfs:
-        return pd.DataFrame()
+            # Очистка имен колонок
+            df.columns = [c.strip() for c in df.columns]
+            
+            # Фильтр только нужных колонок
+            available = [c for c in target_cols if c in df.columns]
+            if available:
+                dfs.append(df[available])
+        except:
+            continue
+            
+    if not dfs: return pd.DataFrame()
     
     full_df = pd.concat(dfs, ignore_index=True)
-    
-    # Нормализация имен колонок (убираем лишние пробелы)
-    full_df.columns = [c.strip() for c in full_df.columns]
-    
-    # Ключевые колонки, которые нам нужны
-    target_cols = ['ID игрока', 'Ник', 'Общий выигрыш игроков + События', 'Выигрыш игрока Ring Game', 'Выигрыш игрока MTT, SNG']
-    
-    # Проверка наличия колонок
-    available_cols = [c for c in target_cols if c in full_df.columns]
-    
-    df_clean = full_df[available_cols].copy()
-    df_clean['ID игрока'] = pd.to_numeric(df_clean['ID игрока'], errors='coerce').fillna(0).astype(int)
+    full_df['ID игрока'] = pd.to_numeric(full_df['ID игрока'], errors='coerce').fillna(0).astype(int)
     
     # Конвертация денег
-    money_cols = [c for c in available_cols if c != 'ID игрока' and c != 'Ник']
-    for c in money_cols:
-        df_clean[c] = df_clean[c].apply(clean_float)
-        
-    # Агрегация по ID (если игрок встречался в нескольких неделях)
-    df_grouped = df_clean.groupby('ID игрока').agg({
+    for col in full_df.columns:
+        if col != 'ID игрока' and col != 'Ник':
+            full_df[col] = full_df[col].apply(fast_clean_float)
+            
+    # Агрегация (суммируем, если загружено несколько недель)
+    agg_df = full_df.groupby('ID игрока').agg({
         'Ник': 'first',
         'Общий выигрыш игроков + События': 'sum',
         'Выигрыш игрока Ring Game': 'sum',
         'Выигрыш игрока MTT, SNG': 'sum'
     }).reset_index()
     
-    return df_grouped
+    return agg_df
 
 # ==========================================
-# 3. АНАЛИТИЧЕСКИЙ ДВИЖОК
+# 3. ВЕКТОРИЗИРОВАННАЯ АНАЛИТИКА (CORE)
 # ==========================================
 
-def calculate_flows(games_df):
+@st.cache_data(show_spinner=False)
+def calculate_network_flows(games_df):
     """
-    Вычисляет, кто кому проиграл деньги (Net Flow).
-    Логика: За конкретным столом (session) сумма выигрышей > 0 распределяется
-    между проигравшими пропорционально их проигрышу.
+    Векторизированный расчет переливов.
+    Вместо циклов используется матричное распределение.
+    Скорость: ~100x быстрее циклов.
     """
     if games_df.empty:
         return pd.DataFrame()
 
-    flows = []
+    # 1. Агрегация по играм: сумма выигрыша победителей
+    # Берем только тех, кто выиграл (>0)
+    winners = games_df[games_df['win'] > 0].copy()
+    losers = games_df[games_df['win'] < 0].copy()
     
-    # Группируем по уникальной игре
-    sessions = games_df.groupby('game_id')
-    
-    for g_id, group in sessions:
-        # Разделяем на победителей и проигравших
-        winners = group[group['win'] > 0]
-        losers = group[group['win'] < 0]
-        
-        if winners.empty or losers.empty:
-            continue
-            
-        total_win = winners['win'].sum()
-        total_loss = abs(losers['win'].sum())
-        
-        # Если дисбаланс (из-за комиссии или ошибок логов), нормализуем по меньшему
-        # Но для оценки перелива нам важно, кто сколько *отдал*
-        
-        # Матрица перелива в этой сессии
-        for _, l_row in losers.iterrows():
-            loss_amt = abs(l_row['win'])
-            l_id = l_row['player_id']
-            
-            for _, w_row in winners.iterrows():
-                w_amt = w_row['win']
-                w_id = w_row['player_id']
-                
-                # Доля выигрыша этого победителя в общем пуле победителей
-                share = w_amt / total_win
-                
-                # Предполагаемая сумма, перетекшая от Лузера к Победителю
-                transfer = loss_amt * share
-                
-                flows.append({
-                    'from': l_id,
-                    'to': w_id,
-                    'amount': transfer,
-                    'game_type': l_row['game_type'],
-                    'bb': l_row['bb'],
-                    'game_id': g_id
-                })
-                
-    return pd.DataFrame(flows)
+    if winners.empty or losers.empty:
+        return pd.DataFrame()
 
-def analyze_player(player_id, general_df, games_df, flows_df):
-    """
-    Главная функция анализа риска для конкретного игрока.
-    """
-    report = {
-        "status": "GREEN",
-        "reasons": [],
-        "metrics": {},
-        "top_donors": [],
-        "games_stats": {}
-    }
+    # Считаем общий банк победителей в каждой раздаче
+    game_pools = winners.groupby('game_id')['win'].sum().reset_index()
+    game_pools.rename(columns={'win': 'total_game_win'}, inplace=True)
     
-    # 1. Данные из "Общее"
-    p_general = general_df[general_df['ID игрока'] == player_id]
-    if p_general.empty:
-        report["metrics"]["total_profit"] = 0.0
-        report["metrics"]["nick"] = "Unknown"
-    else:
-        report["metrics"]["total_profit"] = p_general['Общий выигрыш игроков + События'].sum()
-        report["metrics"]["nick"] = p_general['Ник'].iloc[0]
-        report["metrics"]["ring_profit"] = p_general['Выигрыш игрока Ring Game'].sum()
-
-    # Если игрок в минусе или около нуля, риск минимален (обычно проверяем вывод)
-    if report["metrics"]["total_profit"] < 5:
-        return report # Green
-
-    # 2. Анализ Игр (Ring Games)
-    p_games = games_df[games_df['player_id'] == player_id]
+    # 2. Добавляем информацию о пуле к победителям
+    winners = winners.merge(game_pools, on='game_id')
     
+    # Считаем долю каждого победителя (equity)
+    winners['share'] = winners['win'] / winners['total_game_win']
+    
+    # Оптимизация: оставляем только нужные колонки для merge
+    w_slim = winners[['game_id', 'player_id', 'share']].rename(columns={'player_id': 'to_id'})
+    l_slim = losers[['game_id', 'player_id', 'win', 'bb', 'type']].rename(columns={'player_id': 'from_id', 'win': 'loss_amt'})
+    l_slim['loss_amt'] = l_slim['loss_amt'].abs() # Берем модуль проигрыша
+    
+    # 3. CROSS JOIN внутри каждой игры (Winner x Loser)
+    # Это создает строки для каждой пары: "Игрок А (проиграл) -> Игрок Б (выиграл)"
+    merged = l_slim.merge(w_slim, on='game_id')
+    
+    # 4. Расчет суммы перелива
+    merged['flow_amt'] = merged['loss_amt'] * merged['share']
+    
+    # 5. Агрегация связей (кто кому сколько слил всего)
+    flows = merged.groupby(['from_id', 'to_id']).agg({
+        'flow_amt': 'sum',
+        'bb': 'mean', # средний блайнд игр
+        'game_id': 'nunique', # кол-во совместных игр
+        'type': 'first' # тип игры (преобладает)
+    }).reset_index()
+    
+    return flows
+
+def get_player_stats(pid, general_df, games_df, flows_df):
+    """Сбор всей статистики по конкретному игроку."""
+    
+    res = {"status": "GREEN", "flags": [], "data": {}}
+    
+    # --- Общие данные ---
+    gen_row = general_df[general_df['ID игрока'] == pid]
+    if gen_row.empty:
+        res["data"] = {"nick": "Unknown", "total": 0, "ring": 0}
+        return res
+        
+    total_profit = gen_row['Общий выигрыш игроков + События'].iloc[0]
+    ring_profit = gen_row['Выигрыш игрока Ring Game'].iloc[0]
+    res["data"]["nick"] = gen_row['Ник'].iloc[0]
+    res["data"]["total"] = total_profit
+    res["data"]["ring"] = ring_profit
+    
+    # Если профит маленький, пропускаем детальный анализ
+    if total_profit < 10:
+        return res
+
+    # --- Анализ игр ---
+    p_games = games_df[games_df['player_id'] == pid]
     if p_games.empty:
-        report["status"] = "YELLOW"
-        report["reasons"].append("Нет детальной истории игр, но есть профит в 'Общем'. Требуется ручная проверка источника.")
-        return report
-
-    total_win_games = p_games['win'].sum()
-    total_rake = p_games['rake'].sum()
-    
-    # Эффективность перелива (Rake Check)
-    # Если выиграл много, а комиссии заплатил мало -> подозрительно
-    rake_ratio = total_rake / total_win_games if total_win_games > 0 else 0
-    report["metrics"]["rake_ratio"] = rake_ratio
-    
-    if total_win_games > 100 and rake_ratio < RISK_LOW_RAKE_RATIO and p_general['Выигрыш игрока Ring Game'].sum() > 0:
-        report["reasons"].append(f"🔴 Аномально низкая комиссия ({rake_ratio:.1%}). Возможно, играли мало рук с крупными банками (Dump).")
-        report["status"] = "RED"
-
-    # 3. Анализ Потоков (Flows) - КТО ДОНОР?
-    if not flows_df.empty:
-        # Деньги пришедшие Игроку
-        inflow = flows_df[flows_df['to'] == player_id].copy()
+        res["status"] = "YELLOW"
+        res["flags"].append("Нет истории раздач, но есть профит (возможно джекпот или ошибка выгрузки).")
+        return res
         
-        if not inflow.empty:
-            # Агрегация по донорам
-            donors = inflow.groupby('from').agg({
-                'amount': 'sum',
-                'bb': 'mean', # средний блайнд
-                'game_id': 'nunique' # количество совместных игр
-            }).reset_index().sort_values('amount', ascending=False)
+    real_win = p_games['win'].sum()
+    real_rake = p_games['rake'].sum()
+    rake_ratio = real_rake / real_win if real_win > 0 else 0
+    
+    res["data"]["rake_ratio"] = rake_ratio
+    
+    if real_win > 50 and rake_ratio < RISK_LOW_RAKE:
+        res["status"] = "RED"
+        res["flags"].append(f"Низкая комиссия ({rake_ratio:.1%}). Характерно для дампа префлоп/флоп без рейка.")
+
+    # --- HU (Heads Up) анализ ---
+    # Группируем игры, где участвовал игрок, считаем кол-во записей в каждой игре
+    # Если записей 2 - это HU
+    relevant_games = games_df[games_df['game_id'].isin(p_games['game_id'].unique())]
+    game_counts = relevant_games.groupby('game_id').size()
+    hu_games_ids = game_counts[game_counts == 2].index
+    
+    hu_win = p_games[p_games['game_id'].isin(hu_games_ids)]['win'].sum()
+    hu_share = hu_win / real_win if real_win > 0 else 0
+    
+    res["data"]["hu_share"] = hu_share
+    
+    if hu_share > RISK_HU_SHARE and real_win > 100:
+        current_status = res["status"]
+        res["status"] = "RED"
+        res["flags"].append(f"Игра 1-на-1 (HU): {hu_share:.0%} от всего выигрыша. Это аномалия.")
+
+    # --- Анализ доноров (От кого деньги) ---
+    if not flows_df.empty:
+        # Входящие потоки К игроку
+        inflows = flows_df[flows_df['to_id'] == pid].copy()
+        
+        if not inflows.empty:
+            # Считаем сумму и переводим в BB (если Ring)
+            inflows['amt_bb'] = inflows.apply(lambda x: x['flow_amt'] / x['bb'] if x['bb'] > 0 else 0, axis=1)
             
-            total_received = donors['amount'].sum()
+            top_donors = inflows.sort_values('flow_amt', ascending=False).head(3)
+            res["data"]["donors"] = top_donors
             
             # Топ 1 донор
-            top_donor = donors.iloc[0]
-            top_donor_share = top_donor['amount'] / total_received if total_received > 0 else 0
+            top1 = top_donors.iloc[0]
+            total_received = inflows['flow_amt'].sum()
+            concentration = top1['flow_amt'] / total_received if total_received > 0 else 0
             
-            report["metrics"]["top_donor_id"] = int(top_donor['from'])
-            report["metrics"]["top_donor_amt"] = top_donor['amount']
-            report["metrics"]["concentration"] = top_donor_share
+            res["data"]["concentration"] = concentration
             
-            # Перевод в ББ (приблизительно)
-            avg_bb = top_donor['bb'] if top_donor['bb'] > 0 else 1
-            amount_in_bb = top_donor['amount'] / avg_bb
-            
-            # Логика детекта
-            if top_donor_share > RISK_CONCENTRATION and report["metrics"]["total_profit"] > 50:
-                report["reasons"].append(f"🔴 Высокая концентрация: {top_donor_share:.0%} выигрыша получено от одного игрока (ID {int(top_donor['from'])}).")
-                report["status"] = "RED"
+            # ПРОВЕРКИ
+            if top1['amt_bb'] > RISK_NET_BB and top1['type'] == 'RING':
+                res["status"] = "RED"
+                res["flags"].append(f"Крупный чистый выигрыш у ID {int(top1['from_id'])}: {top1['amt_bb']:.1f} BB.")
                 
-            if amount_in_bb > RISK_HIGH_NET_FLOW_BB:
-                report["reasons"].append(f"🔴 Крупный чистый выигрыш у одного игрока: {amount_in_bb:.0f} BB (>{RISK_HIGH_NET_FLOW_BB} BB).")
-                if report["status"] != "RED": report["status"] = "RED" # Усиление до красного
-                
-            # Добавляем инфо в отчет
-            for _, row in donors.head(3).iterrows():
-                report["top_donors"].append({
-                    "id": int(row['from']),
-                    "amount": row['amount'],
-                    "games": int(row['game_id'])
-                })
+            if concentration > RISK_CONCENTRATION and real_win > 100:
+                res["status"] = "RED"
+                res["flags"].append(f"Концентрация: {concentration:.0%} выигрыша пришло от одного игрока.")
 
-    # 4. Анализ HU (Heads Up)
-    # Считаем, сколько денег выиграно, когда за столом (в файле) было только 2 человека
-    # Примечание: парсер группирует по game_id. Если там 2 записи - это HU.
-    session_sizes = games_df.groupby('game_id').size()
-    hu_game_ids = session_sizes[session_sizes == 2].index
-    
-    hu_wins = p_games[p_games['game_id'].isin(hu_game_ids)]['win'].sum()
-    hu_share = hu_wins / total_win_games if total_win_games > 0 else 0
-    
-    report["metrics"]["hu_share"] = hu_share
-    
-    if hu_share > RISK_HU_SHARE and total_win_games > 50:
-        report["reasons"].append(f"🟠 {hu_share:.0%} выигрыша получено в Heads-Up (игра 1 на 1).")
-        if report["status"] == "GREEN": report["status"] = "YELLOW"
-
-    return report
+    return res
 
 # ==========================================
-# 4. ИНТЕРФЕЙС STREAMLIT
+# 4. ИНТЕРФЕЙС ПРИЛОЖЕНИЯ
 # ==========================================
 
-st.title("🕵️‍♂️ PPPoker Security Check")
-st.markdown("**Инструмент для выявления перелива фишек (Chip Dumping)**")
+st.title("🛡️ PPPoker Anti-Fraud Analytics 2.0")
 
-with st.expander("ℹ️ Инструкция (развернуть)"):
-    st.markdown("""
-    1. Загрузите файлы **Общее.csv/xlsx** (можно несколько за разные недели).
-    2. Загрузите файлы **Игры.csv** (выгрузка истории рук).
-    3. Введите **ID игрока**.
-    4. Система проанализирует:
-       - Источники денег (кто проиграл этому игроку).
-       - Концентрацию выигрыша (все деньги от одного человека?).
-       - Странности в комиссии и типах игры.
-    """)
+# Session State для хранения данных
+if 'data_loaded' not in st.session_state:
+    st.session_state.data_loaded = False
+    st.session_state.df_general = pd.DataFrame()
+    st.session_state.df_games = pd.DataFrame()
+    st.session_state.df_flows = pd.DataFrame()
 
-# --- Блок загрузки ---
-col_u1, col_u2 = st.columns(2)
-with col_u1:
-    files_general = st.file_uploader("📂 1. Загрузить 'ОБЩЕЕ' (недели)", accept_multiple_files=True, type=['csv', 'xlsx'])
-with col_u2:
-    files_games = st.file_uploader("📂 2. Загрузить 'ИГРЫ' (детализация)", accept_multiple_files=True, type=['csv', 'txt'])
-
-# --- Обработка данных ---
-if files_general and files_games:
-    with st.spinner("Анализ базы данных..."):
-        df_general = load_general_files(files_general)
-        df_games_raw = parse_games_file(files_games)
-        
-        # Кэшируем расчет потоков для всей базы (это самая тяжелая операция)
-        if not df_games_raw.empty:
-            df_flows = calculate_flows(df_games_raw)
+# Боковая панель
+with st.sidebar:
+    st.header("Загрузка данных")
+    u_gen = st.file_uploader("1. Файлы 'Общее'", type=['xlsx', 'csv'], accept_multiple_files=True)
+    u_gam = st.file_uploader("2. Файлы 'Игры'", type=['csv', 'txt'], accept_multiple_files=True)
+    
+    if st.button("📥 Загрузить и обработать", type="primary"):
+        if u_gen and u_gam:
+            with st.status("Обработка данных..."):
+                st.write("Чтение 'Общее'...")
+                st.session_state.df_general = load_general_data(u_gen)
+                
+                st.write("Парсинг 'Игры' (это может занять время)...")
+                st.session_state.df_games = parse_games_optimized(u_gam)
+                
+                st.write("Расчет матрицы переливов...")
+                st.session_state.df_flows = calculate_network_flows(st.session_state.df_games)
+                
+                st.session_state.data_loaded = True
+                st.write("Готово!")
         else:
-            df_flows = pd.DataFrame()
-            
-    st.success(f"Загружено: {len(df_general)} записей профилей и {len(df_games_raw)} игровых сессий.")
-    st.divider()
+            st.error("Загрузите оба типа файлов!")
 
-    # --- Блок проверки ---
-    col_input, col_res = st.columns([1, 2])
+    if st.session_state.data_loaded:
+        st.success(f"В базе: {len(st.session_state.df_general)} игроков")
+        if st.button("Очистить базу"):
+            st.session_state.data_loaded = False
+            st.rerun()
+
+# Основное окно
+if not st.session_state.data_loaded:
+    st.info("👈 Пожалуйста, загрузите файлы в меню слева для начала работы.")
+    st.markdown("""
+    ### Как это работает?
+    1. Система считывает логи игр и строит граф переливов фишек.
+    2. Вычисляется **Net Flow** (чистый переток денег от игрока к игроку).
+    3. Анализируется **эффективность рейка** и **доля Heads-Up**.
+    4. При вводе ID вы получаете мгновенный вердикт.
+    """)
+else:
+    col_search, col_res = st.columns([1, 2])
     
-    with col_input:
-        st.subheader("Проверка игрока")
-        target_id = st.number_input("Введите ID игрока", min_value=0, value=0, step=1)
-        btn_check = st.button("🔍 Анализировать", type="primary")
-
-    if btn_check and target_id > 0:
-        report = analyze_player(target_id, df_general, df_games_raw, df_flows)
+    with col_search:
+        st.subheader("Проверка вывода")
+        target_id = st.number_input("ID Игрока", min_value=0, step=1)
+        check_btn = st.button("🔍 Проверить игрока", type="primary", use_container_width=True)
+        
+    if check_btn and target_id > 0:
+        # Запуск анализа
+        report = get_player_stats(
+            target_id, 
+            st.session_state.df_general, 
+            st.session_state.df_games, 
+            st.session_state.df_flows
+        )
         
         with col_res:
-            # Карточка вердикта
-            if report["status"] == "RED":
-                st.error(f"⛔ ВЕРДИКТ: ВЫСОКИЙ РИСК (ПЕРЕЛИВ)")
-                st.markdown("**Действие:** Блокировка вывода. Передача в СБ для ручного разбора раздач.")
-            elif report["status"] == "YELLOW":
-                st.warning(f"⚠️ ВЕРДИКТ: ПОДОЗРИТЕЛЬНО")
-                st.markdown("**Действие:** Запросить проверку раздач. Возможен 'мягкий' перелив или бамхант.")
+            # Отображение статуса
+            status = report["status"]
+            if status == "RED":
+                st.error("⛔ ВЕРДИКТ: ВЫСОКИЙ РИСК (Отправить в СБ)")
+            elif status == "YELLOW":
+                st.warning("⚠️ ВЕРДИКТ: ЕСТЬ ПОДОЗРЕНИЯ (Ручная проверка)")
             else:
-                st.success(f"✅ ВЕРДИКТ: ЧИСТО")
-                st.markdown("**Действие:** Можно проводить вывод.")
+                st.success("✅ ВЕРДИКТ: ЧИСТО (Разрешен вывод)")
+            
+            # Метрики
+            d = report["data"]
+            if not d:
+                st.write("Нет данных по игроку.")
+            else:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Ник", d.get('nick', 'N/A'))
+                c1.metric("Общий Профит", f"{d.get('total', 0):.2f}")
+                
+                rake_pct = d.get('rake_ratio', 0) * 100
+                c2.metric("Комиссия", f"{rake_pct:.1f}%", delta="-Низкая" if rake_pct < 3.5 else None, delta_color="inverse")
+                
+                hu_pct = d.get('hu_share', 0) * 100
+                c3.metric("Доля HU", f"{hu_pct:.0f}%", delta="-Высокая" if hu_pct > 80 else None, delta_color="inverse")
 
-            # Причины
-            if report["reasons"]:
+                # Причины
+                if report["flags"]:
+                    st.write("---")
+                    st.subheader("🚩 Обнаруженные проблемы:")
+                    for f in report["flags"]:
+                        st.write(f"- {f}")
+                
+                # Таблица доноров
+                if "donors" in d and not d["donors"].empty:
+                    st.write("---")
+                    st.subheader("💸 Источники денег (Топ доноры)")
+                    donors_view = d["donors"][['from_id', 'flow_amt', 'amt_bb', 'game_id']].copy()
+                    donors_view.columns = ['ID Донора', 'Сумма', 'В Блайндах (BB)', 'Кол-во игр']
+                    st.dataframe(donors_view, hide_index=True)
+                
+                # Текст для менеджера
                 st.write("---")
-                st.subheader("Обнаруженные паттерны:")
-                for reason in report["reasons"]:
-                    st.write(reason)
-            
-            # Детали
-            st.write("---")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Никнейм", report["metrics"].get("nick", "N/A"))
-            c1.metric("Общий профит", f"{report['metrics']['total_profit']:.2f}")
-            
-            c2.metric("Комиссия % (Rake)", f"{report['metrics'].get('rake_ratio', 0):.1%}", help="Норма > 5%. Меньше 3% - признак перелива.")
-            c2.metric("HU доля (1 на 1)", f"{report['metrics'].get('hu_share', 0):.1%}", help="Если > 80% профита сделано 1 на 1, это подозрительно.")
-            
-            top_conc = report['metrics'].get('concentration', 0)
-            c3.metric("Концентрация", f"{top_conc:.1%}", help="Какая часть денег пришла от ТОП-1 донора.")
-
-            # Таблица доноров
-            if report["top_donors"]:
-                st.write("---")
-                st.markdown("#### 💸 От кого получены деньги (Топ-3):")
-                donors_df = pd.DataFrame(report["top_donors"])
-                donors_df.columns = ["ID Донора", "Сумма (перелито)", "Кол-во игр"]
-                st.dataframe(donors_df, hide_index=True)
-
-            # Генерация текста для менеджера
-            st.write("---")
-            with st.expander("📋 Текст отчета для копирования"):
-                res_text = f"Проверка ID: {target_id}\nСтатус: {report['status']}\nПрофит: {report['metrics']['total_profit']:.2f}\n"
-                if report["reasons"]:
-                    res_text += "Причины риска:\n" + "\n".join(report["reasons"])
-                else:
-                    res_text += "Подозрительных активностей по метрикам не найдено."
-                st.code(res_text)
-
-elif files_general or files_games:
-    st.info("Пожалуйста, загрузите оба типа файлов ('Общее' и 'Игры') для корректного анализа.")
-else:
-    st.info("Ожидание загрузки файлов...")
+                with st.expander("📋 Скопировать отчет"):
+                    flag_txt = "\n".join([f"- {x}" for x in report["flags"]]) if report["flags"] else "Паттернов перелива не выявлено."
+                    res_text = (
+                        f"Проверка ID: {target_id} ({d.get('nick')})\n"
+                        f"Статус: {status}\n"
+                        f"Профит: {d.get('total', 0):.2f}\n"
+                        f"Комиссия: {rake_pct:.1f}%\n"
+                        f"Аналитика:\n{flag_txt}"
+                    )
+                    st.code(res_text)
