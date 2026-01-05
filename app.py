@@ -13,7 +13,7 @@ import streamlit.components.v1 as components
 # =========================
 # CONFIG
 # =========================
-APP_TITLE = "PPPoker | риск/anti-fraud — проверка игроков (chip dumping / collusion)"
+APP_TITLE = "PPPoker — проверка игроков клуба Value"
 CACHE_DIR = Path(".pppoker_app_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
