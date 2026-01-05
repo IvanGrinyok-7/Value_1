@@ -1782,8 +1782,11 @@ with tab_check:
         sec_text = build_security_message(int(pid), decision, int(score), weeks_mode, int(week_from), int(week_to), signals)
 
         if decision in ("FAST_CHECK", "MANUAL_REVIEW"):
-            st.textarea("Текст для СБ (можно копировать/скачать)", value=sec_text, height=260, key="sec_msg_area")
-            copy_to_clipboard_button(st.session_state.get("sec_msg_area", sec_text), sec_text, label="Скопировать текст для СБ")
+            st.text_area("Текст для СБ (можно копировать/скачать)", value=sec_text, height=260, key="sec_msg_area")
+           copy_to_clipboard_button(
+    st.session_state.get("sec_msg_area", sec_text),
+    label="Скопировать текст для СБ",
+)
             st.download_button(
                 "Скачать .txt",
                 data=st.session_state.get("sec_msg_area", sec_text).encode("utf-8"),
