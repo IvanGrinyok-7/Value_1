@@ -1,66 +1,73 @@
 import io
 import re
 import json
-import hashlib
 import datetime as dt
+import traceback
 from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
-# ============================================================
+# =========================
 # CONFIG
-# ============================================================
-APP_TITLE = "PPPoker | anti-fraud — проверка игрока (перелив / collusion)"
+# =========================
+APP_TITLE = "PPPoker | риск/anti-fraud — проверка игроков (chip dumping / collusion)"
 CACHE_DIR = Path(".pppoker_app_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-DB_REGISTRY = CACHE_DIR / "db_registry.json"
-GAMES_REGISTRY = CACHE_DIR / "games_registry.json"
+DB_KEY = "db_file"
+GAMES_KEY = "games_file"
 
-# Decision thresholds (консервативно: лучше лишний FAST_CHECK, чем пропустить перелив)
-T_APPROVE = 15
-T_FAST_CHECK = 35
+# --- RATING THRESHOLDS ---
+T_APPROVE = 25
+T_FAST_CHECK = 55
 
-# Coverage: если по играм мало данных — не делаем уверенный APPROVE для выигрывающих
-MIN_RING_GAMES_FOR_APPROVE = 3
-
-# Ring / pair thresholds (BB-aware)
-PAIR_NET_ALERT_RING_BB = 20.0
-PAIR_NET_CRITICAL_RING_BB = 45.0
-
-PAIR_GROSS_ALERT_RING_BB = 100.0
-PAIR_GROSS_CRITICAL_RING_BB = 220.0
-
-PAIR_PARTNER_SHARE_ALERT = 0.55
-HU_DOMINANCE_MIN_HU = 2
-HU_DOMINANCE_RATIO = 0.70
-HU_TOP_PARTNER_SHARE = 0.80
-
-# Co-play concentration
-MIN_SESSIONS_FOR_COPLAY = 6
+# --- CO-PLAY / COLLUSION ---
+MIN_SESSIONS_FOR_COPLAY = 1
 COPLAY_TOP2_SHARE_SUSP = 0.85
 
-# Tournament thresholds (currency)
+# HU dominance (важно для переливов)
+HU_DOMINANCE_MIN_HU = 2
+HU_DOMINANCE_RATIO = 0.75
+
+# --- FLOWS (BB-aware) ---
+PAIR_NET_ALERT_RING_BB = 25.0
+PAIR_NET_CRITICAL_RING_BB = 50.0
+
+# Collusion turnover
+PAIR_GROSS_ALERT_RING_BB = 120.0
+PAIR_GROSS_CRITICAL_RING_BB = 250.0
+
+PAIR_ONE_SIDED_ALERT = 0.88
+PAIR_DIR_CONSIST_ALERT = 0.78
+PAIR_PARTNER_SHARE_ALERT = 0.60
+
+PAIR_MIN_SHARED_SESSIONS_STRONG = 2
+PAIR_MIN_PAIR_GAMES_STRONG = 3
+
+# Tournaments thresholds in currency
 PAIR_NET_ALERT_TOUR = 60.0
 PAIR_GROSS_ALERT_TOUR = 150.0
 
-# ============================================================
-# PPPoker export regex
-# ============================================================
+# Extremes
+SINGLE_GAME_WIN_ALERT_TOUR = 150.0
+
+# Regex PPPoker export
 GAME_ID_RE = re.compile(r"ID игры:\s*([0-9\.\-eE]+(?:-[0-9]+)?)", re.IGNORECASE)
 TABLE_NAME_RE = re.compile(r"Название стола:\s*(.+?)\s*$", re.IGNORECASE)
-START_END_RE = re.compile(r"Начало:\s*([0-9/: \s]+)\s+By.+?Окончание:\s*([0-9/: \s]+)", re.IGNORECASE)
+START_END_RE = re.compile(r"Начало:\s*([0-9/:\s]+)\s+By.+?Окончание:\s*([0-9/:\s]+)", re.IGNORECASE)
 
+# Type hints
 RING_HINT_RE = re.compile(r"\bPPSR\b|PLO|OFC|NLH|Bomb Pot|Ante|3-1|HU\b|Heads", re.IGNORECASE)
 TOUR_HINT_RE = re.compile(r"\bPPST\b|Бай-ин:|satellite|pko|mko\b|SNG\b|MTT\b", re.IGNORECASE)
+
+# Stakes: 0.2/0.4
 STAKES_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)")
 
-# ============================================================
-# DB columns ("Общее.csv")
-# ============================================================
+# DB columns (sheet "Общий")
 COL_WEEK = "Номер недели"
 COL_PLAYER_ID = "ID игрока"
 COL_COUNTRY = "Страна/регион"
@@ -82,12 +89,14 @@ COL_CLUB_INCOME_TOTAL = "Доход клуба Общий"
 COL_CLUB_COMMISSION = "Доход клуба Комиссия"
 COL_CLUB_COMM_PPST = "Доход клуба Комиссия (только PPST)"
 COL_CLUB_COMM_PPSR = "Доход клуба Комиссия (только PPSR)"
+COL_CLUB_COMM_NO_PPST = "Доход клуба Комиссия (без PPST)"
+COL_CLUB_COMM_NO_PPSR = "Доход клуба Комиссия (без PPSR)"
 
 EXTRA_PLAYER_WIN_COL_PREFIX = "Выигрыш игрока "
 
-# ============================================================
-# PERSISTENT CACHE (multi-file registry)
-# ============================================================
+# =========================
+# Persistent file cache
+# =========================
 class BytesFile:
     def __init__(self, content: bytes, name: str):
         self._content = content
@@ -96,82 +105,55 @@ class BytesFile:
     def getvalue(self) -> bytes:
         return self._content
 
-def _sha12(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest()[:12]
+def _bin_path(key: str) -> Path:
+    return CACHE_DIR / f"{key}.bin"
 
-def _read_registry(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+def _meta_path(key: str) -> Path:
+    return CACHE_DIR / f"{key}.json"
 
-def _write_registry(path: Path, items: list[dict]) -> None:
-    path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+def cache_save_uploaded(key: str, uploaded_file) -> None:
+    if uploaded_file is None:
+        return
+    content = uploaded_file.getvalue()
+    name = getattr(uploaded_file, "name", key)
+    _bin_path(key).write_bytes(content)
+    _meta_path(key).write_text(
+        json.dumps(
+            {"name": name, "bytes": len(content), "saved_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
-def _save_file_to_cache(prefix: str, content: bytes, original_name: str) -> dict:
-    fid = _sha12(content)
-    bin_path = CACHE_DIR / f"{prefix}_{fid}.bin"
-    if not bin_path.exists():
-        bin_path.write_bytes(content)
-    return {
-        "id": fid,
-        "name": original_name,
-        "bytes": int(len(content)),
-        "saved_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "path": str(bin_path),
-    }
-
-def registry_add_files(registry_path: Path, prefix: str, uploaded_files: list) -> int:
-    if not uploaded_files:
-        return 0
-    reg = _read_registry(registry_path)
-    existing = {x.get("id") for x in reg}
-    added = 0
-    for f in uploaded_files:
-        content = f.getvalue()
-        name = getattr(f, "name", f"{prefix}.bin")
-        meta = _save_file_to_cache(prefix, content, name)
-        if meta["id"] not in existing:
-            reg.append(meta)
-            existing.add(meta["id"])
-            added += 1
-    _write_registry(registry_path, reg)
-    return added
-
-def registry_clear(registry_path: Path, prefix: str) -> None:
-    reg = _read_registry(registry_path)
-    for x in reg:
-        p = Path(x.get("path", ""))
-        if p.exists() and p.is_file() and p.name.startswith(f"{prefix}_") and p.parent == CACHE_DIR:
-            try:
-                p.unlink()
-            except Exception:
-                pass
-    if registry_path.exists():
+def cache_load_file(key: str):
+    bp = _bin_path(key)
+    mp = _meta_path(key)
+    if not bp.exists():
+        return None
+    content = bp.read_bytes()
+    name = key
+    if mp.exists():
         try:
-            registry_path.unlink()
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+            name = meta.get("name", key)
         except Exception:
             pass
+    return BytesFile(content, name)
 
-def registry_load_bytes(registry_path: Path) -> tuple[list[bytes], list[str]]:
-    reg = _read_registry(registry_path)
-    contents, names = [], []
-    for x in reg:
-        p = Path(x.get("path", ""))
+def cache_clear(key: str) -> None:
+    for p in (_bin_path(key), _meta_path(key)):
         if p.exists():
-            try:
-                contents.append(p.read_bytes())
-                names.append(str(x.get("name", p.name)))
-            except Exception:
-                pass
-    return contents, names
+            p.unlink()
 
-# ============================================================
+def resolve_file(key: str, uploaded_file):
+    if uploaded_file is not None:
+        cache_save_uploaded(key, uploaded_file)
+        return uploaded_file
+    return cache_load_file(key)
+
+# =========================
 # Helpers
-# ============================================================
+# =========================
 def detect_delimiter(sample_bytes: bytes) -> str:
     sample = sample_bytes[:8000].decode("utf-8", errors="ignore")
     candidates = [";", ",", "\t"]
@@ -196,25 +178,25 @@ def to_float_series(s: pd.Series) -> pd.Series:
     x = x.replace({"": np.nan, "None": np.nan, "nan": np.nan})
     return pd.to_numeric(x, errors="coerce")
 
-def safe_div(a, b):
-    if b is None or b == 0 or (isinstance(b, float) and np.isnan(b)):
-        return np.nan
-    return a / b
-
-def fmt_money(v) -> str:
+def fmt_money(v):
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return "NaN"
     return f"{float(v):.2f}"
 
-def fmt_bb(v) -> str:
-    if v is None or (isinstance(v, float) and np.isnan(v)):
+def fmt_pct(x) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
         return "NaN"
-    return f"{float(v):.1f} BB"
+    return f"{float(x) * 100:.0f}%"
 
-def fmt_pct(v) -> str:
-    if v is None or (isinstance(v, float) and np.isnan(v)):
+def fmt_bb(x) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
         return "NaN"
-    return f"{float(v) * 100:.0f}%"
+    return f"{float(x):.1f} BB"
+
+def safe_div(a, b):
+    if b is None or b == 0 or (isinstance(b, float) and np.isnan(b)):
+        return np.nan
+    return a / b
 
 def risk_decision(score: int) -> str:
     if score < T_APPROVE:
@@ -232,23 +214,14 @@ def decision_badge(decision: str) -> tuple[str, str]:
 
 def manager_actions(decision: str) -> list[str]:
     if decision == "APPROVE":
-        return [
-            "Разрешить вывод.",
-            "Если сумма крупная — выборочно проверить 1–2 последние сессии.",
-        ]
+        return ["Разрешить вывод.", "Если сумма крупная — выборочно проверить 1–2 последние сессии."]
     if decision == "FAST_CHECK":
-        return [
-            "Быстро проверить топ-партнёра(ов): shared sessions + net/gross + HU.",
-            "Если подтверждается паттерн перелива — отправить в СБ.",
-        ]
-    return [
-        "Отправить в СБ на ручную проверку.",
-        "Проверить раздачи/карты по ключевым сессиям (особенно HU/3-max).",
-    ]
+        return ["Быстро проверить топ‑партнёра: shared sessions + net/gross + HU.", "Если подтверждается перелив — в СБ."]
+    return ["Отправить в СБ на ручную проверку.", "Проверить HH по ключевым сессиям (особенно HU/3‑max)."]
 
-# ============================================================
-# DB LOAD
-# ============================================================
+# =========================
+# DB LOAD (CSV/XLSX)
+# =========================
 def load_db_any(file_obj) -> pd.DataFrame:
     name = (getattr(file_obj, "name", "") or "").lower()
     content = file_obj.getvalue()
@@ -274,7 +247,6 @@ def load_db_any(file_obj) -> pd.DataFrame:
     out = out.dropna(subset=["_player_id"]).copy()
     out["_player_id"] = out["_player_id"].astype(int)
 
-    # meta text
     for src, dst in [
         (COL_COUNTRY, "_country"),
         (COL_NICK, "_nick"),
@@ -284,7 +256,6 @@ def load_db_any(file_obj) -> pd.DataFrame:
     ]:
         out[dst] = df.loc[out.index, src].astype(str).fillna("").str.strip() if src in df.columns else ""
 
-    # meta numeric
     for src, dst in [(COL_AGENT_ID, "_agent_id"), (COL_SUPER_AGENT_ID, "_super_agent_id")]:
         out[dst] = pd.to_numeric(df.loc[out.index, src], errors="coerce") if src in df.columns else np.nan
 
@@ -299,91 +270,24 @@ def load_db_any(file_obj) -> pd.DataFrame:
         COL_CLUB_COMMISSION: "_club_comm_total",
         COL_CLUB_COMM_PPST: "_club_comm_ppst",
         COL_CLUB_COMM_PPSR: "_club_comm_ppsr",
+        COL_CLUB_COMM_NO_PPST: "_club_comm_no_ppst",
+        COL_CLUB_COMM_NO_PPSR: "_club_comm_no_ppsr",
     }
     for src, dst in base_num_cols.items():
         out[dst] = to_float_series(df.loc[out.index, src]) if src in df.columns else np.nan
 
     extra_cols = [c for c in df.columns if isinstance(c, str) and c.startswith(EXTRA_PLAYER_WIN_COL_PREFIX)]
+    already = set(base_num_cols.keys())
+    extra_cols = [c for c in extra_cols if c not in already]
     for c in extra_cols:
-        if c in base_num_cols:
-            continue
         norm = "_p_extra__" + re.sub(r"[^a-zA-Z0-9а-яА-Я_]+", "_", c.replace(EXTRA_PLAYER_WIN_COL_PREFIX, "").strip())
         out[norm] = to_float_series(df.loc[out.index, c])
 
     return out
 
-def apply_weeks_filter(dbdf: pd.DataFrame, mode: str, last_n: int, week_from: int, week_to: int) -> pd.DataFrame:
-    d = dbdf.copy()
-    weeks = sorted([int(w) for w in d["_week"].unique().tolist() if int(w) >= 0])
-
-    if mode == "ALL" or not weeks:
-        return d
-
-    if mode == "LAST_N":
-        maxw = max(weeks)
-        minw = maxw - max(0, int(last_n) - 1)
-        return d[(d["_week"] >= minw) & (d["_week"] <= maxw)].copy()
-
-    return d[(d["_week"] >= int(week_from)) & (d["_week"] <= int(week_to))].copy()
-
-def db_summary_for_player(db_period: pd.DataFrame, player_id: int):
-    d = db_period[db_period["_player_id"] == int(player_id)].copy()
-    if d.empty:
-        return None, None, None
-
-    num_cols = [c for c in d.columns if c.startswith("_j_") or c.startswith("_p_") or c.startswith("_club_")]
-    by_week = d.groupby("_week", as_index=False)[num_cols].sum(min_count=1).sort_values("_week")
-
-    agg = by_week[num_cols].sum(numeric_only=True)
-
-    j_total = float(agg.get("_j_total", 0.0) or 0.0)
-    p_total = float(agg.get("_p_total", 0.0) or 0.0)
-    p_ring = float(agg.get("_p_ring", 0.0) or 0.0)
-    p_mtt = float(agg.get("_p_mtt", 0.0) or 0.0)
-    p_jackpot = float(agg.get("_p_jackpot", 0.0) or 0.0)
-    p_equity = float(agg.get("_p_equity", 0.0) or 0.0)
-
-    comm_total = float(agg.get("_club_comm_total", 0.0) or 0.0)
-    comm_ppsr = float(agg.get("_club_comm_ppsr", 0.0) or 0.0)
-    comm_ppst = float(agg.get("_club_comm_ppst", 0.0) or 0.0)
-
-    events_delta = j_total - p_total
-
-    # Для выплат важнее положительная прибыль игрока (кто выводит — обычно выигрывающий)
-    player_profit = float((p_ring or 0.0) + (p_mtt or 0.0) + (p_jackpot or 0.0) + (p_equity or 0.0))
-
-    if by_week.empty or abs(j_total) < 1e-9:
-        top_week_share = np.nan
-    else:
-        top_week_j = float(by_week.sort_values("_j_total", ascending=False).iloc[0]["_j_total"] or 0.0)
-        top_week_share = safe_div(top_week_j, j_total)
-
-    meta = d.sort_values("_week").iloc[-1].to_dict()
-
-    summary = {
-        "week_cnt": int(by_week.shape[0]),
-        "j_total": j_total,
-        "p_total": p_total,
-        "p_ring": p_ring,
-        "p_mtt": p_mtt,
-        "p_jackpot": p_jackpot,
-        "p_equity": p_equity,
-        "player_profit": player_profit,
-        "events_delta": float(events_delta),
-        "comm_total": comm_total,
-        "comm_ppsr": comm_ppsr,
-        "comm_ppst": comm_ppst,
-        "top_week_share": top_week_share,
-        "meta": meta,
-    }
-    return summary, by_week, meta
-
-# ============================================================
-# GAMES PARSER
-# ============================================================
-def _split_semicolon(line: str) -> list[str]:
-    return [p.strip().strip('"') for p in line.split(";")]
-
+# =========================
+# GAMES PARSER (+BB)
+# =========================
 def _extract_bb_any(*texts: str) -> float:
     for t in texts:
         if not t:
@@ -410,6 +314,9 @@ def _classify_game_type(descriptor: str, table_name: str = "") -> str:
         return "RING"
     return "UNKNOWN"
 
+def _split_semicolon(line: str) -> list[str]:
+    return [p.strip().strip('"') for p in line.split(";")]
+
 def parse_games_pppoker_export(file_obj) -> pd.DataFrame:
     text = file_obj.getvalue().decode("utf-8", errors="ignore")
     lines = text.splitlines()
@@ -425,11 +332,9 @@ def parse_games_pppoker_export(file_obj) -> pd.DataFrame:
         "start_time": None,
         "end_time": None,
     }
+
     header = None
     idx = {}
-
-    def find_col(h: list[str], col: str):
-        return h.index(col) if col in h else None
 
     for line in lines:
         m = GAME_ID_RE.search(line)
@@ -459,11 +364,16 @@ def parse_games_pppoker_export(file_obj) -> pd.DataFrame:
             current["start_time"] = se.group(1).strip()
             current["end_time"] = se.group(2).strip()
 
-        # descriptor line
+        # descriptor detection
         if ("ID игрока" not in line) and ("Итог" not in line):
             is_desc = False
-            if ("PPSR" in line) or ("PPST" in line) or TOUR_HINT_RE.search(line) or STAKES_RE.search(line):
+            if ("PPSR" in line) or ("PPST" in line):
                 is_desc = True
+            elif TOUR_HINT_RE.search(line):
+                is_desc = True
+            elif STAKES_RE.search(line):
+                is_desc = True
+
             if is_desc and (not current["descriptor"] or ("PPSR" in line) or ("PPST" in line)):
                 current["descriptor"] = line.strip()
                 current["product"] = "PPSR" if "PPSR" in line else ("PPST" if "PPST" in line else "")
@@ -474,24 +384,22 @@ def parse_games_pppoker_export(file_obj) -> pd.DataFrame:
         if "ID игрока" in line:
             header = _split_semicolon(line)
 
-            pid_i = find_col(header, "ID игрока")
-            nick_i = find_col(header, "Ник")
-            ign_i = find_col(header, "Игровое имя")
-            hands_i = find_col(header, "Раздачи")
-            fee_i = find_col(header, "Комиссия")
+            def find(col):
+                return header.index(col) if col in header else None
 
-            # FIX: do NOT use `or` with numeric indices (0 is falsy)
-            win_i = find_col(header, "Выигрыш")
-            if win_i is None:
-                win_i = find_col(header, "Выигрыш игрока")
+            # ---------- FIX: never use `or` with indices ----------
+            win_idx = find("Выигрыш")
+            if win_idx is None:
+                win_idx = find("Выигрыш игрока")
+            # -----------------------------------------------------
 
             idx = {
-                "player_id": pid_i,
-                "nick": nick_i,
-                "ign": ign_i,
-                "hands": hands_i,
-                "win": win_i,
-                "fee": fee_i,
+                "player_id": find("ID игрока"),
+                "nick": find("Ник"),
+                "ign": find("Игровое имя"),
+                "hands": find("Раздачи"),
+                "win": win_idx,
+                "fee": find("Комиссия"),
             }
             continue
 
@@ -511,7 +419,7 @@ def parse_games_pppoker_export(file_obj) -> pd.DataFrame:
             continue
 
         row = {
-            "game_id": str(current["game_id"]),
+            "game_id": current["game_id"],
             "game_type": current["game_type"],
             "product": current["product"],
             "table_name": current["table_name"],
@@ -530,16 +438,17 @@ def parse_games_pppoker_export(file_obj) -> pd.DataFrame:
 
         if idx.get("hands") is not None and idx["hands"] < len(parts):
             row["hands"] = to_float(parts[idx["hands"]])
-
         if idx.get("fee") is not None and idx["fee"] < len(parts):
             row["fee"] = to_float(parts[idx["fee"]])
 
-        # Ring: win_total and win_vs_opponents обычно идут рядом с "Раздачи"
         if current["game_type"] == "RING":
             hidx = idx.get("hands")
             if hidx is not None and hidx + 2 < len(parts):
-                row["win_total"] = to_float(parts[hidx + 1])
-                row["win_vs_opponents"] = to_float(parts[hidx + 2])
+                try:
+                    row["win_total"] = to_float(parts[hidx + 1])
+                    row["win_vs_opponents"] = to_float(parts[hidx + 2])
+                except Exception:
+                    pass
             if pd.isna(row["win_total"]):
                 widx = idx.get("win")
                 if widx is not None and widx < len(parts):
@@ -554,9 +463,8 @@ def parse_games_pppoker_export(file_obj) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=[
-            "game_id", "game_type", "product", "table_name", "descriptor", "bb",
-            "start_time", "end_time", "player_id", "nick", "ign",
-            "hands", "win_total", "win_vs_opponents", "fee"
+            "game_id", "game_type", "product", "table_name", "descriptor", "bb", "start_time", "end_time",
+            "player_id", "nick", "ign", "hands", "win_total", "win_vs_opponents", "fee"
         ])
 
     for c in ["bb", "hands", "win_total", "win_vs_opponents", "fee"]:
@@ -565,12 +473,13 @@ def parse_games_pppoker_export(file_obj) -> pd.DataFrame:
     df = df.dropna(subset=["player_id", "game_id"]).copy()
     df["player_id"] = df["player_id"].astype(int)
     df["game_id"] = df["game_id"].astype(str)
+
     df.loc[(df["game_type"] == "UNKNOWN") & df["bb"].notna(), "game_type"] = "RING"
     return df
 
-# ============================================================
-# SESSIONS + FLOWS
-# ============================================================
+# =========================
+# SESSIONS
+# =========================
 def build_sessions_from_games(games_df: pd.DataFrame) -> pd.DataFrame:
     if games_df.empty:
         return pd.DataFrame(columns=["session_id", "game_type", "players", "players_n"])
@@ -584,6 +493,9 @@ def build_sessions_from_games(games_df: pd.DataFrame) -> pd.DataFrame:
     g = g[g["players_n"] >= 2].copy()
     return g
 
+# =========================
+# FLOWS (HU exact + multiway approx)
+# =========================
 def build_pair_flows_fast(games_df: pd.DataFrame) -> pd.DataFrame:
     if games_df.empty:
         return pd.DataFrame(columns=["from_player", "to_player", "game_type", "amount", "amount_bb", "games_cnt"])
@@ -617,7 +529,6 @@ def build_pair_flows_fast(games_df: pd.DataFrame) -> pd.DataFrame:
         bb = float(part["bb"].max()) if gtype == "RING" else np.nan
         bb_ok = (bb > 0) if gtype == "RING" else False
 
-        # HU exact
         if nplayers == 2:
             wrow = winners.sort_values("_flow_win", ascending=False).iloc[0]
             lrow = losers.sort_values("_flow_win", ascending=True).iloc[0]
@@ -632,7 +543,6 @@ def build_pair_flows_fast(games_df: pd.DataFrame) -> pd.DataFrame:
                 games_cnt[key] = games_cnt.get(key, 0) + 1
             continue
 
-        # multiway approx
         total_pos = float(winners["_flow_win"].sum())
         if total_pos <= 0:
             continue
@@ -675,19 +585,50 @@ def build_pair_flows_fast(games_df: pd.DataFrame) -> pd.DataFrame:
     )
     return out
 
-# ============================================================
-# INDEXES
-# ============================================================
-def build_indexes(games_df: pd.DataFrame, sessions_df: pd.DataFrame, flows_df: pd.DataFrame):
+# =========================
+# INDEXES (ваш текущий подход)
+# =========================
+def build_games_indexes(games_df: pd.DataFrame, sessions_df: pd.DataFrame, flows_df: pd.DataFrame):
     idx = {}
 
-    # --- coplay ---
+    # player_game_series (dir consistency)
+    if games_df.empty:
+        idx["player_game_series"] = {}
+        idx["extremes"] = {}
+    else:
+        d = games_df[["game_type", "player_id", "game_id", "win_total", "win_vs_opponents"]].copy()
+        d["_flow_win"] = np.where(
+            (d["game_type"] == "RING") & d["win_vs_opponents"].notna(),
+            d["win_vs_opponents"],
+            d["win_total"],
+        )
+        d = d[d["_flow_win"].notna()].copy()
+        d["_flow_win"] = pd.to_numeric(d["_flow_win"], errors="coerce")
+        d = d[d["_flow_win"].notna()].copy()
+        d["player_id"] = d["player_id"].astype(int)
+        d["game_id"] = d["game_id"].astype(str)
+
+        series = {}
+        extremes = {}
+        for (gt, pid), g in d.groupby(["game_type", "player_id"], sort=False):
+            s = pd.Series(g["_flow_win"].to_numpy(dtype=float), index=g["game_id"].to_numpy())
+            series[(gt, int(pid))] = s
+            if gt == "TOURNAMENT":
+                big = s[s >= SINGLE_GAME_WIN_ALERT_TOUR]
+                extremes[(gt, int(pid))] = list(big.index[:12]) if not big.empty else []
+            else:
+                extremes[(gt, int(pid))] = []
+        idx["player_game_series"] = series
+        idx["extremes"] = extremes
+
+    # sessions inverted + coplay counters (incl HU-specific)
     sessions_by_player = defaultdict(list)
     sessions_n = {}
     coplay_counter = defaultdict(lambda: defaultdict(int))
     coplay_counter_hu = defaultdict(lambda: defaultdict(int))
     coplay_sessions_cnt = defaultdict(int)
     coplay_hu_cnt = defaultdict(int)
+    coplay_sh_cnt = defaultdict(int)
 
     if not sessions_df.empty:
         for sid, gt, players, pn in sessions_df[["session_id", "game_type", "players", "players_n"]].itertuples(index=False):
@@ -702,6 +643,8 @@ def build_indexes(games_df: pd.DataFrame, sessions_df: pd.DataFrame, flows_df: p
                 coplay_sessions_cnt[key] += 1
                 if pn == 2:
                     coplay_hu_cnt[key] += 1
+                if pn <= 3:
+                    coplay_sh_cnt[key] += 1
 
             for i in range(len(pls)):
                 pi = pls[i]
@@ -722,359 +665,540 @@ def build_indexes(games_df: pd.DataFrame, sessions_df: pd.DataFrame, flows_df: p
     idx["coplay_counter_hu"] = {k: dict(v) for k, v in coplay_counter_hu.items()}
     idx["coplay_sessions_cnt"] = dict(coplay_sessions_cnt)
     idx["coplay_hu_cnt"] = dict(coplay_hu_cnt)
+    idx["coplay_sh_cnt"] = dict(coplay_sh_cnt)
 
-    # --- ring_stats per player ---
-    ring_stats = {}
-    if not games_df.empty:
-        g = games_df[games_df["game_type"] == "RING"].copy()
-        if not g.empty:
-            g = g[g["player_id"].notna()].copy()
-            g["player_id"] = g["player_id"].astype(int)
+    # flows -> in/out maps + totals + top pair
+    if flows_df.empty:
+        idx["in_map"] = {}
+        idx["out_map"] = {}
+        idx["flow_totals"] = {}
+        idx["top_pair"] = {}
+        return idx
 
-            g["_hands"] = pd.to_numeric(g["hands"], errors="coerce").fillna(0.0)
-            g["_fee"] = pd.to_numeric(g["fee"], errors="coerce").fillna(0.0)
-            g["_w"] = np.where(g["win_vs_opponents"].notna(), g["win_vs_opponents"], g["win_total"])
-            g["_w"] = pd.to_numeric(g["_w"], errors="coerce").fillna(0.0)
-            g["_bb"] = pd.to_numeric(g["bb"], errors="coerce")
+    f = flows_df.copy()
+    f["from_player"] = f["from_player"].astype(int)
+    f["to_player"] = f["to_player"].astype(int)
 
-            g["_w_bb"] = np.where(g["_bb"].notna() & (g["_bb"] > 0), g["_w"] / g["_bb"], np.nan)
-            g["_fee_bb"] = np.where(g["_bb"].notna() & (g["_bb"] > 0), g["_fee"] / g["_bb"], np.nan)
+    in_map = {}
+    for (gt, to_pid), g in f.groupby(["game_type", "to_player"], sort=False):
+        s = g.groupby("from_player")["amount"].sum().sort_values(ascending=False)
+        in_map[(gt, int(to_pid))] = s
 
-            for pid, part in g.groupby("player_id", sort=False):
-                hands_sum = float(part["_hands"].sum() or 0.0)
-                fee_sum = float(part["_fee"].sum() or 0.0)
-                w_sum = float(part["_w"].sum() or 0.0)
-                w_bb_sum = float(np.nansum(part["_w_bb"].to_numpy(dtype=float)))
-                fee_bb_sum = float(np.nansum(part["_fee_bb"].to_numpy(dtype=float)))
-                games_cnt = int(part["game_id"].nunique())
+    out_map = {}
+    for (gt, from_pid), g in f.groupby(["game_type", "from_player"], sort=False):
+        s = g.groupby("to_player")["amount"].sum().sort_values(ascending=False)
+        out_map[(gt, int(from_pid))] = s
 
-                ring_stats[int(pid)] = {
-                    "ring_games": games_cnt,
-                    "hands": hands_sum,
-                    "fee": fee_sum,
-                    "win": w_sum,
-                    "win_bb": w_bb_sum,
-                    "fee_bb": fee_bb_sum,
-                    "bb_per_100hands": safe_div(w_bb_sum, (hands_sum / 100.0)) if hands_sum > 0 else np.nan,
-                }
+    idx["in_map"] = in_map
+    idx["out_map"] = out_map
 
-    idx["ring_stats"] = ring_stats
+    inflow_total = f.groupby(["game_type", "to_player"])["amount"].sum()
+    outflow_total = f.groupby(["game_type", "from_player"])["amount"].sum()
+    flow_totals = {}
+    for (gt, pid), in_amt in inflow_total.items():
+        pid = int(pid)
+        out_amt = float(outflow_total.get((gt, pid), 0.0))
+        in_amt = float(in_amt)
+        gross = in_amt + out_amt
+        one_sided = abs(in_amt - out_amt) / gross if gross > 0 else 0.0
+        flow_totals[(gt, pid)] = {"in": in_amt, "out": out_amt, "gross": gross, "one_sided": float(one_sided)}
+    for (gt, pid), out_amt in outflow_total.items():
+        pid = int(pid)
+        if (gt, pid) in flow_totals:
+            continue
+        out_amt = float(out_amt)
+        gross = out_amt
+        flow_totals[(gt, pid)] = {"in": 0.0, "out": out_amt, "gross": gross, "one_sided": 1.0 if gross > 0 else 0.0}
+    idx["flow_totals"] = flow_totals
 
-    # --- pair_map: multiple partners per player ---
-    pair_map = defaultdict(list)
-    if not flows_df.empty:
-        f = flows_df.copy()
-        f["from_player"] = f["from_player"].astype(int)
-        f["to_player"] = f["to_player"].astype(int)
+    # top pair by abs(net_bb) for RING (fallback to abs(net))
+    tmp = f[["game_type", "from_player", "to_player", "amount", "amount_bb", "games_cnt"]].copy()
+    tmp["p"] = tmp[["from_player", "to_player"]].min(axis=1)
+    tmp["q"] = tmp[["from_player", "to_player"]].max(axis=1)
 
-        tmp = f[["game_type", "from_player", "to_player", "amount", "amount_bb", "games_cnt"]].copy()
-        tmp["p"] = tmp[["from_player", "to_player"]].min(axis=1)
-        tmp["q"] = tmp[["from_player", "to_player"]].max(axis=1)
+    tmp["signed_to_q_amt"] = np.where(tmp["to_player"] == tmp["q"], tmp["amount"], -tmp["amount"])
+    tmp["signed_to_q_bb"] = np.where(tmp["to_player"] == tmp["q"], tmp["amount_bb"], -tmp["amount_bb"])
 
-        tmp["signed_to_q_amt"] = np.where(tmp["to_player"] == tmp["q"], tmp["amount"], -tmp["amount"])
-        tmp["signed_to_q_bb"] = np.where(tmp["to_player"] == tmp["q"], tmp["amount_bb"], -tmp["amount_bb"])
+    pair = tmp.groupby(["game_type", "p", "q"], as_index=False).agg(
+        net_to_q=("signed_to_q_amt", "sum"),
+        net_to_q_bb=("signed_to_q_bb", "sum"),
+        gross=("amount", "sum"),
+        gross_bb=("amount_bb", "sum"),
+        games_cnt=("games_cnt", "sum"),
+    )
 
-        pair = tmp.groupby(["game_type", "p", "q"], as_index=False).agg(
-            net_to_q=("signed_to_q_amt", "sum"),
-            net_to_q_bb=("signed_to_q_bb", "sum"),
-            gross=("amount", "sum"),
-            gross_bb=("amount_bb", "sum"),
-            games_cnt=("games_cnt", "sum"),
-        )
+    vq = pair.rename(columns={"q": "player_id", "p": "partner_id", "net_to_q": "net", "net_to_q_bb": "net_bb"})
+    vp = pair.rename(columns={"p": "player_id", "q": "partner_id", "net_to_q": "net", "net_to_q_bb": "net_bb"})
+    vp["net"] = -vp["net"]
+    vp["net_bb"] = -vp["net_bb"]
 
-        vq = pair.rename(columns={"q": "player_id", "p": "partner_id", "net_to_q": "net", "net_to_q_bb": "net_bb"})
-        vp = pair.rename(columns={"p": "player_id", "q": "partner_id", "net_to_q": "net", "net_to_q_bb": "net_bb"})
-        vp["net"] = -vp["net"]
-        vp["net_bb"] = -vp["net_bb"]
+    player_pairs = pd.concat([vq, vp], ignore_index=True)
+    player_pairs["player_id"] = player_pairs["player_id"].astype(int)
+    player_pairs["partner_id"] = player_pairs["partner_id"].astype(int)
 
-        pairs = pd.concat([vq, vp], ignore_index=True)
-        pairs["player_id"] = pairs["player_id"].astype(int)
-        pairs["partner_id"] = pairs["partner_id"].astype(int)
+    gross_total = player_pairs.groupby(["game_type", "player_id"])["gross"].sum()
+    gross_total_bb = player_pairs.groupby(["game_type", "player_id"])["gross_bb"].sum()
 
-        gross_tot = pairs.groupby(["game_type", "player_id"])["gross"].sum()
-        gross_tot_bb = pairs.groupby(["game_type", "player_id"])["gross_bb"].sum()
+    def pair_rank_row(r):
+        if r["game_type"] == "RING" and pd.notna(r["net_bb"]):
+            return abs(float(r["net_bb"]))
+        return abs(float(r["net"]))
 
-        for gt, pid, partner, net, net_bb, gross, gross_bb, gcnt in pairs[[
-            "game_type", "player_id", "partner_id", "net", "net_bb", "gross", "gross_bb", "games_cnt"
-        ]].itertuples(index=False):
-            pid = int(pid)
-            partner = int(partner)
-            gtot = float(gross_tot.get((gt, pid), 0.0) or 0.0)
-            gtot_bb = float(gross_tot_bb.get((gt, pid), 0.0) or 0.0)
+    player_pairs["_rank"] = player_pairs.apply(pair_rank_row, axis=1)
+    top_rows = player_pairs.sort_values("_rank", ascending=False).groupby(["game_type", "player_id"], as_index=False).head(1)
 
-            pair_map[(gt, pid)].append({
-                "partner": partner,
-                "net": float(net),
-                "net_bb": float(net_bb) if pd.notna(net_bb) else np.nan,
-                "gross": float(gross),
-                "gross_bb": float(gross_bb) if pd.notna(gross_bb) else np.nan,
-                "games_cnt": int(gcnt),
-                "partner_share": (float(gross) / gtot) if gtot > 0 else 0.0,
-                "partner_share_bb": (float(gross_bb) / gtot_bb) if (gtot_bb > 0 and pd.notna(gross_bb)) else np.nan,
-            })
-
-        def _rank(gt: str, x: dict) -> float:
-            if gt == "RING" and pd.notna(x["net_bb"]):
-                return abs(float(x["net_bb"]))
-            return abs(float(x["net"]))
-
-        for key in list(pair_map.keys()):
-            gt, _pid = key
-            pair_map[key].sort(key=lambda x: _rank(gt, x), reverse=True)
-
-    idx["pair_map"] = dict(pair_map)
+    top_pair = {}
+    for gt, pid, partner, net, net_bb, gross, gross_bb, gcnt, _rank in top_rows[
+        ["game_type", "player_id", "partner_id", "net", "net_bb", "gross", "gross_bb", "games_cnt", "_rank"]
+    ].itertuples(index=False):
+        gt = str(gt); pid = int(pid); partner = int(partner)
+        gtot = float(gross_total.get((gt, pid), 0.0))
+        gtot_bb = float(gross_total_bb.get((gt, pid), 0.0))
+        top_pair[(gt, pid)] = {
+            "partner": partner,
+            "net": float(net),
+            "net_bb": float(net_bb) if pd.notna(net_bb) else np.nan,
+            "gross": float(gross),
+            "gross_bb": float(gross_bb) if pd.notna(gross_bb) else np.nan,
+            "gross_total": gtot,
+            "gross_total_bb": gtot_bb,
+            "partner_share": float(gross / gtot) if gtot > 0 else 0.0,
+            "partner_share_bb": float(gross_bb / gtot_bb) if (gtot_bb > 0 and pd.notna(gross_bb)) else np.nan,
+            "games_cnt": int(gcnt),
+        }
+    idx["top_pair"] = top_pair
     return idx
 
-def coplay_features(target_id: int, idx: dict, game_type: str) -> dict:
+# =========================
+# FEATURES
+# =========================
+def coplay_features_fast(target_id: int, idx: dict, game_type: str) -> dict:
     key = (game_type, int(target_id))
-    sessions_cnt = int(idx.get("coplay_sessions_cnt", {}).get(key, 0))
+    sessions_count = int(idx.get("coplay_sessions_cnt", {}).get(key, 0))
     hu_sessions = int(idx.get("coplay_hu_cnt", {}).get(key, 0))
-
+    sh_sessions = int(idx.get("coplay_sh_cnt", {}).get(key, 0))
     counter = idx.get("coplay_counter", {}).get(key, {})
-    partners = sorted(counter.items(), key=lambda x: x[1], reverse=True)
-    top2_share = float((partners[0][1] + partners[1][1]) / sessions_cnt) if sessions_cnt and len(partners) >= 2 else 0.0
 
-    huc = idx.get("coplay_counter_hu", {}).get(key, {})
-    hups = sorted(huc.items(), key=lambda x: x[1], reverse=True)
-    top_hu_partner = int(hups[0][0]) if hups else None
-    top_hu_share = float(hups[0][1] / max(1, hu_sessions)) if hups else 0.0
+    partners = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+    unique_opponents = len(partners)
+    top2_share = float((partners[0][1] + partners[1][1]) / sessions_count) if sessions_count and len(partners) >= 2 else 0.0
+
+    hu_counter = idx.get("coplay_counter_hu", {}).get(key, {})
+    hu_partners = sorted(hu_counter.items(), key=lambda x: x[1], reverse=True)
+    top_hu_partner = int(hu_partners[0][0]) if hu_partners else None
+    top_hu_share = float(hu_partners[0][1] / max(1, hu_sessions)) if hu_partners else 0.0
 
     return {
-        "sessions_cnt": sessions_cnt,
+        "sessions_count": sessions_count,
+        "unique_opponents": unique_opponents,
+        "top2_coplay_share": top2_share,
         "hu_sessions": hu_sessions,
-        "unique_opponents": len(partners),
-        "top2_share": top2_share,
+        "sh_sessions": sh_sessions,
+        "top_partners": partners[:12],
         "top_hu_partner": top_hu_partner,
         "top_hu_share": top_hu_share,
     }
 
-def shared_sessions(pid_a: int, pid_b: int, idx: dict, game_type: str, limit: int = 30) -> list[str]:
+def _shared_sessions_list(pid_a: int, pid_b: int, idx: dict, game_type: str, limit: int = 20) -> list[str]:
     a = idx.get("sessions_by_player", {}).get((game_type, int(pid_a)), [])
     b = idx.get("sessions_by_player", {}).get((game_type, int(pid_b)), [])
     if not a or not b:
         return []
-    sa = set(a) if len(a) < len(b) else set(b)
-    sb = b if len(a) < len(b) else a
-    shared = [x for x in sb if x in sa]
+    if len(a) < len(b):
+        sb = set(a)
+        shared = [x for x in b if x in sb]
+    else:
+        sa = set(a)
+        shared = [x for x in b if x in sa]
     return shared[:limit]
 
-# ============================================================
-# SCORING (explainable, multi-partner)
-# ============================================================
-def score_player(player_id: int, db_sum: dict, idx: dict, games_loaded: bool) -> tuple[int, str, list[str], dict]:
-    pid = int(player_id)
-    reasons = []
+def pair_ctx_fast(target_id: int, partner_id: int, idx: dict, game_type: str) -> dict:
+    shared = _shared_sessions_list(target_id, partner_id, idx, game_type, limit=999999)
+    shared_cnt = int(len(shared))
+
+    hu_share = 0.0
+    if shared_cnt:
+        sess_n = idx.get("sessions_n", {})
+        hu = sum(1 for sid in shared if sess_n.get((game_type, sid), 0) == 2)
+        hu_share = hu / shared_cnt
+
+    s1 = idx.get("player_game_series", {}).get((game_type, int(target_id)))
+    s2 = idx.get("player_game_series", {}).get((game_type, int(partner_id)))
+    if s1 is None or s2 is None:
+        dir_cons = 0.0
+    else:
+        a1, a2 = s1.align(s2, join="inner")
+        if a1.empty:
+            dir_cons = 0.0
+        else:
+            t = a1.to_numpy(dtype=float)
+            p = a2.to_numpy(dtype=float)
+            dir1 = float(np.mean((t > 0) & (p < 0)))
+            dir2 = float(np.mean((t < 0) & (p > 0)))
+            dir_cons = max(dir1, dir2)
+
+    return {"shared_sessions": shared_cnt, "hu_share": float(hu_share), "dir_consistency": float(dir_cons)}
+
+def transfer_features_fast(target_id: int, idx: dict, game_type: str) -> dict:
+    pid = int(target_id)
+
+    in_s = idx.get("in_map", {}).get((game_type, pid))
+    out_s = idx.get("out_map", {}).get((game_type, pid))
+    top_inflows = [(int(k), float(v)) for k, v in in_s.head(12).items()] if in_s is not None and len(in_s) else []
+    top_outflows = [(int(k), float(v)) for k, v in out_s.head(12).items()] if out_s is not None and len(out_s) else []
+
+    totals = idx.get("flow_totals", {}).get((game_type, pid), {"in": 0.0, "out": 0.0, "gross": 0.0, "one_sided": 0.0})
+    top = idx.get("top_pair", {}).get((game_type, pid))
+
+    if top is None:
+        return {
+            "top_inflows": top_inflows,
+            "top_outflows": top_outflows,
+            "top_net_partner": None,
+            "top_net": 0.0,
+            "top_net_bb": np.nan,
+            "top_gross": 0.0,
+            "top_gross_bb": np.nan,
+            "top_partner_share": 0.0,
+            "top_partner_share_bb": np.nan,
+            "top_pair_games_cnt": 0,
+            "one_sidedness": float(totals.get("one_sided", 0.0)),
+            "pair_ctx": {},
+            "shared_sessions_preview": [],
+        }
+
+    partner = int(top["partner"])
+    ctx = pair_ctx_fast(pid, partner, idx, game_type)
+    shared_preview = _shared_sessions_list(pid, partner, idx, game_type, limit=20)
+
+    return {
+        "top_inflows": top_inflows,
+        "top_outflows": top_outflows,
+        "top_net_partner": partner,
+        "top_net": float(top["net"]),
+        "top_net_bb": float(top["net_bb"]) if pd.notna(top["net_bb"]) else np.nan,
+        "top_gross": float(top["gross"]),
+        "top_gross_bb": float(top["gross_bb"]) if pd.notna(top["gross_bb"]) else np.nan,
+        "top_partner_share": float(top["partner_share"]),
+        "top_partner_share_bb": float(top["partner_share_bb"]) if pd.notna(top["partner_share_bb"]) else np.nan,
+        "top_pair_games_cnt": int(top.get("games_cnt", 0) or 0),
+        "one_sidedness": float(totals.get("one_sided", 0.0)),
+        "pair_ctx": ctx,
+        "shared_sessions_preview": shared_preview,
+    }
+
+# =========================
+# PERIOD FILTER + DB SUMMARY
+# =========================
+def apply_weeks_filter(db_df: pd.DataFrame, weeks_mode: str, last_n: int, week_from: int, week_to: int) -> pd.DataFrame:
+    d = db_df.copy()
+    weeks = sorted([w for w in d["_week"].unique().tolist() if w >= 0])
+    if weeks_mode == "Все недели":
+        return d
+    if weeks_mode == "Последние N недель":
+        if not weeks:
+            return d
+        max_w = max(weeks)
+        min_w = max_w - max(0, int(last_n) - 1)
+        return d[(d["_week"] >= min_w) & (d["_week"] <= max_w)].copy()
+    return d[(d["_week"] >= int(week_from)) & (d["_week"] <= int(week_to))].copy()
+
+def db_summary_for_player(db_period: pd.DataFrame, player_id: int):
+    d = db_period[db_period["_player_id"] == int(player_id)].copy()
+    if d.empty:
+        return None, None
+
+    num_cols = [c for c in d.columns if c.startswith(("_j_", "_p_", "_club_", "_ticket_", "_custom_"))]
+    by_week = d.groupby("_week", as_index=False)[num_cols].sum(min_count=1).sort_values("_week")
+    agg = by_week[num_cols].sum(numeric_only=True)
+
+    total_j = float(agg.get("_j_total", 0.0) or 0.0)
+    p_total = float(agg.get("_p_total", 0.0) or 0.0)
+    p_ring = float(agg.get("_p_ring", 0.0) or 0.0)
+    p_mtt = float(agg.get("_p_mtt", 0.0) or 0.0)
+
+    comm_total = float(agg.get("_club_comm_total", 0.0) or 0.0)
+    comm_ppsr = float(agg.get("_club_comm_ppsr", 0.0) or 0.0)
+    comm_ppst = float(agg.get("_club_comm_ppst", 0.0) or 0.0)
+
+    events_delta = float(total_j - p_total)
+    poker_profit = float((p_ring or 0.0) + (p_mtt or 0.0))
+    ring_over_comm_ppsr = safe_div(p_ring, comm_ppsr) if comm_ppsr > 0 else np.nan
+
+    if by_week.empty:
+        top_week_share = np.nan
+    else:
+        top_row = by_week.sort_values("_j_total", ascending=False).iloc[0]
+        top_week_j = float(top_row.get("_j_total", 0.0) or 0.0)
+        top_week_share = safe_div(top_week_j, total_j) if total_j != 0 else np.nan
+
+    meta_row = d.sort_values("_week").iloc[-1]
+    meta = {
+        "player_id": int(player_id),
+        "country": str(meta_row.get("_country", "")),
+        "nick": str(meta_row.get("_nick", "")),
+        "ign": str(meta_row.get("_ign", "")),
+        "agent": str(meta_row.get("_agent", "")),
+        "agent_id": meta_row.get("_agent_id", np.nan),
+        "super_agent": str(meta_row.get("_super_agent", "")),
+        "super_agent_id": meta_row.get("_super_agent_id", np.nan),
+    }
+
+    summary = {
+        "weeks_count": int(len(by_week)),
+        "j_total": total_j,
+        "p_total": p_total,
+        "events_delta": events_delta,
+        "p_ring": p_ring,
+        "p_mtt": p_mtt,
+        "poker_profit": poker_profit,
+        "comm_total": comm_total,
+        "comm_ppsr": comm_ppsr,
+        "comm_ppst": comm_ppst,
+        "ring_over_comm_ppsr": ring_over_comm_ppsr,
+        "top_week_share": top_week_share,
+        "meta": meta,
+    }
+    return summary, by_week
+
+def agent_match_bonus(db_df: pd.DataFrame, pid_a: int, pid_b: int) -> tuple[int, str | None]:
+    a = db_df[db_df["_player_id"] == pid_a].tail(1)
+    b = db_df[db_df["_player_id"] == pid_b].tail(1)
+    if a.empty or b.empty:
+        return 0, None
+
+    a_ag = a.iloc[0].get("_agent_id")
+    b_ag = b.iloc[0].get("_agent_id")
+    if pd.notna(a_ag) and pd.notna(b_ag) and float(a_ag) == float(b_ag):
+        return 6, "Оба игрока у одного агента."
+
+    a_sag = a.iloc[0].get("_super_agent_id")
+    b_sag = b.iloc[0].get("_super_agent_id")
+    if pd.notna(a_sag) and pd.notna(b_sag) and float(a_sag) == float(b_sag):
+        return 4, "Оба игрока у одного суперагента."
+
+    return 0, None
+
+# =========================
+# SCORING (ваша логика, без падений)
+# =========================
+def score_player_period(db_df: pd.DataFrame, db_sum: dict, cop_ring: dict, cop_tour: dict, trf_ring: dict, trf_tour: dict, coverage: dict):
     score = 0
+    reasons = []
 
-    # ---- DB core ----
-    j_total = float(db_sum.get("j_total", 0.0) or 0.0)
+    pid = int(db_sum["meta"]["player_id"])
+
+    j_tot = float(db_sum.get("j_total", 0.0) or 0.0)
     events_delta = float(db_sum.get("events_delta", 0.0) or 0.0)
-    week_cnt = int(db_sum.get("week_cnt", 0) or 0)
+    weeks_cnt = int(db_sum.get("weeks_count", 0) or 0)
     top_week_share = db_sum.get("top_week_share", np.nan)
-    player_profit = float(db_sum.get("player_profit", 0.0) or 0.0)
 
-    # Сигналы ориентируем на вывод (обычно игрок в плюсе)
-    if player_profit >= 800:
-        score += 10
-        reasons.append(f"DB: большой профит игрока (Ring+MTT+Jackpot+Equity) = {fmt_money(player_profit)}.")
-    elif player_profit >= 300:
-        score += 6
-        reasons.append(f"DB: заметный профит игрока = {fmt_money(player_profit)}.")
-
-    # Разница “J total” vs “player total” может быть индикатором странной структуры доходов/событий
-    if abs(events_delta) >= max(80.0, 0.35 * max(1.0, abs(j_total))):
-        score += 6
-        reasons.append(f"DB: сильная разница 'J total' vs 'Player total' = {fmt_money(events_delta)}.")
-
-    if week_cnt >= 3 and pd.notna(top_week_share) and float(top_week_share) >= 0.80 and player_profit >= 300:
-        score += 5
-        reasons.append(f"DB: концентрация результата в одной неделе {fmt_pct(float(top_week_share))}.")
-
-    # ---- Games signals ----
-    ring_cov = idx.get("ring_stats", {}).get(pid, {})
-    ring_games = int(ring_cov.get("ring_games", 0) or 0)
-
-    cop_ring = coplay_features(pid, idx, "RING")
-    pairs_ring = idx.get("pair_map", {}).get(("RING", pid), [])
-    pairs_tour = idx.get("pair_map", {}).get(("TOURNAMENT", pid), [])
-
-    # Если games не загружены — не делаем “чистый” вывод для выигрывающих
-    if not games_loaded and player_profit >= 200:
-        score = max(score, T_APPROVE)
-        reasons.append("COVERAGE: файл 'Игры' не загружен, для выводящего игрока требуется минимум FAST_CHECK.")
-
-    # Co-play concentration
-    if cop_ring["sessions_cnt"] >= MIN_SESSIONS_FOR_COPLAY and cop_ring["top2_share"] >= COPLAY_TOP2_SHARE_SUSP:
+    if j_tot >= 800:
         score += 8
-        reasons.append(f"GAMES: co-play концентрирован (топ-2 оппонента = {fmt_pct(cop_ring['top2_share'])} сессий).")
+        reasons.append(f"DB: крупный плюс по '{COL_J_TOTAL}' (выплаты обычно идут с плюсовых).")
+    elif j_tot >= 300:
+        score += 4
+        reasons.append(f"DB: заметный плюс по '{COL_J_TOTAL}' (контроль усилен).")
 
-    hu_ratio = float(cop_ring["hu_sessions"] / max(1, cop_ring["sessions_cnt"]))
-    if cop_ring["hu_sessions"] >= HU_DOMINANCE_MIN_HU and hu_ratio >= HU_DOMINANCE_RATIO:
-        score += 12
-        reasons.append(f"GAMES: доминация HU (HU {cop_ring['hu_sessions']} из {cop_ring['sessions_cnt']} = {fmt_pct(hu_ratio)}).")
+    if abs(events_delta) >= max(80.0, 0.35 * max(1.0, abs(j_tot))):
+        score += 6
+        reasons.append(f"DB: большая разница '{COL_J_TOTAL}' и '{COL_PLAYER_WIN_TOTAL}' — много 'событий' (джекпот/эквити).")
 
-    if cop_ring["top_hu_partner"] is not None and cop_ring["hu_sessions"] >= HU_DOMINANCE_MIN_HU and cop_ring["top_hu_share"] >= HU_TOP_PARTNER_SHARE:
-        score += 10
-        reasons.append(f"GAMES: HU почти всегда с одним партнёром {cop_ring['top_hu_partner']} (share {fmt_pct(cop_ring['top_hu_share'])}).")
+    if weeks_cnt >= 3 and pd.notna(top_week_share) and float(top_week_share) >= 0.80 and abs(j_tot) >= 300:
+        score += 5
+        reasons.append("DB: сильная концентрация результата в одной неделе.")
 
-    # Pair risk: check top 3 Ring partners
-    strongest_partner = None
-    strongest_points = 0
+    ring_over_comm_ppsr = db_sum.get("ring_over_comm_ppsr", np.nan)
+    p_ring = float(db_sum.get("p_ring", 0.0) or 0.0)
+    comm_ppsr = float(db_sum.get("comm_ppsr", 0.0) or 0.0)
+    if pd.notna(ring_over_comm_ppsr) and comm_ppsr >= 10.0 and float(ring_over_comm_ppsr) >= 10 and abs(p_ring) >= 200:
+        score += 5
+        reasons.append(f"DB: '{COL_PLAYER_WIN_RING}' слишком высок относительно '{COL_CLUB_COMM_PPSR}'.")
 
-    for p in pairs_ring[:3]:
-        partner = int(p["partner"])
-        net_bb = p.get("net_bb", np.nan)
-        gross_bb = p.get("gross_bb", np.nan)
+    ring_games = int(coverage.get("ring_games", 0))
+    tour_games = int(coverage.get("tour_games", 0))
+    if ring_games + tour_games == 0:
+        reasons.append("GAMES: нет покрытия по играм (файл не загружен/игрок не найден/парсинг не смог).")
+    else:
+        reasons.append(f"GAMES: покрытие есть (Ring игр {ring_games}, турниров {tour_games}).")
 
-        pshare = p.get("partner_share_bb", np.nan)
-        if pd.isna(pshare):
-            pshare = float(p.get("partner_share", 0.0) or 0.0)
-
-        shared = shared_sessions(pid, partner, idx, "RING", limit=50)
-        shared_cnt = len(shared)
-
-        hu_in_shared = 0
-        for sid in shared:
-            if idx.get("sessions_n", {}).get(("RING", sid), 0) == 2:
-                hu_in_shared += 1
-        hu_share = float(hu_in_shared / max(1, shared_cnt)) if shared_cnt > 0 else 0.0
-
-        local_points = 0
-        local_reasons = []
-
-        if pd.notna(net_bb) and abs(float(net_bb)) >= PAIR_NET_CRITICAL_RING_BB:
-            local_points += 40
-            local_reasons.append(f"RING: крупный net-flow с {partner}: {fmt_bb(net_bb)} (shared sessions={shared_cnt}).")
-        elif pd.notna(net_bb) and abs(float(net_bb)) >= PAIR_NET_ALERT_RING_BB and pshare >= PAIR_PARTNER_SHARE_ALERT:
-            local_points += 22
-            local_reasons.append(f"RING: net-flow с {partner}: {fmt_bb(net_bb)} при доле оборота {fmt_pct(pshare)} (shared={shared_cnt}).")
-
-        if pd.notna(gross_bb) and float(gross_bb) >= PAIR_GROSS_CRITICAL_RING_BB and pshare >= PAIR_PARTNER_SHARE_ALERT and shared_cnt >= 2:
-            local_points += 20
-            local_reasons.append(f"RING: высокий gross-turnover с {partner}: {fmt_bb(gross_bb)} и доля {fmt_pct(pshare)}.")
-        elif pd.notna(gross_bb) and float(gross_bb) >= PAIR_GROSS_ALERT_RING_BB and pshare >= PAIR_PARTNER_SHARE_ALERT and shared_cnt >= 1:
-            local_points += 10
-            local_reasons.append(f"RING: заметный gross-turnover с {partner}: {fmt_bb(gross_bb)} и доля {fmt_pct(pshare)}.")
-
-        if shared_cnt >= 1 and hu_share >= 0.70 and pshare >= PAIR_PARTNER_SHARE_ALERT:
-            local_points += 10
-            local_reasons.append(f"RING: много HU в общих сессиях с {partner}: HU-share {fmt_pct(hu_share)}.")
-
-        if local_points > strongest_points:
-            strongest_points = local_points
-            strongest_partner = partner
-
-        if local_points > 0:
-            score += min(30, local_points)  # ограничиваем вклад одного партнёра
-            reasons.extend(local_reasons)
-
-    # Tournament pairs (weaker)
-    for p in pairs_tour[:2]:
-        partner = int(p["partner"])
-        net = float(p.get("net", 0.0) or 0.0)
-        gross = float(p.get("gross", 0.0) or 0.0)
-        pshare = float(p.get("partner_share", 0.0) or 0.0)
-        shared_cnt = len(shared_sessions(pid, partner, idx, "TOURNAMENT", limit=50))
-
-        if abs(net) >= PAIR_NET_ALERT_TOUR and pshare >= 0.60:
-            score += 8
-            reasons.append(f"TOUR: net-flow {fmt_money(net)} с {partner} при доле {fmt_pct(pshare)} (shared={shared_cnt}).")
-        if gross >= PAIR_GROSS_ALERT_TOUR and pshare >= 0.60 and shared_cnt >= 1:
+    # Co-play Ring
+    if cop_ring["sessions_count"] >= MIN_SESSIONS_FOR_COPLAY:
+        if cop_ring["sessions_count"] >= 6 and cop_ring["unique_opponents"] <= 5:
             score += 6
-            reasons.append(f"TOUR: gross-turnover {fmt_money(gross)} с {partner} при доле {fmt_pct(pshare)} (shared={shared_cnt}).")
+            reasons.append("GAMES/RING: узкий пул оппонентов при достаточном числе сессий.")
 
-    # Coverage guard: мало ring-данных + игрок в плюсе
-    if games_loaded and ring_games < MIN_RING_GAMES_FOR_APPROVE and player_profit >= 200:
-        score = max(score, T_APPROVE)
-        reasons.append(f"COVERAGE: мало Ring данных (ring_games={ring_games}) при профите {fmt_money(player_profit)} → минимум FAST_CHECK.")
+        if cop_ring["top2_coplay_share"] >= COPLAY_TOP2_SHARE_SUSP and cop_ring["sessions_count"] >= 6:
+            score += 6
+            reasons.append("GAMES/RING: топ‑2 оппонента встречаются почти всегда (связка).")
+
+        hu_ratio = cop_ring["hu_sessions"] / max(1, cop_ring["sessions_count"])
+        if cop_ring["hu_sessions"] >= HU_DOMINANCE_MIN_HU and hu_ratio >= HU_DOMINANCE_RATIO:
+            score += 8
+            reasons.append("GAMES/RING: доминирует HU (типичный формат перелива).")
+
+        if cop_ring.get("top_hu_partner") is not None and cop_ring["hu_sessions"] >= HU_DOMINANCE_MIN_HU and cop_ring.get("top_hu_share", 0.0) >= 0.80:
+            score += 8
+            reasons.append(f"GAMES/RING: HU почти всегда с одним партнёром ({cop_ring['top_hu_partner']}).")
+
+    def check_flow(trf: dict, label: str):
+        nonlocal score, reasons
+        partner = trf.get("top_net_partner")
+        if partner is None:
+            return
+
+        net_val = float(trf.get("top_net", 0.0) or 0.0)
+        net_bb = trf.get("top_net_bb", np.nan)
+        gross_val = float(trf.get("top_gross", 0.0) or 0.0)
+        gross_bb = trf.get("top_gross_bb", np.nan)
+        pair_games_cnt = int(trf.get("top_pair_games_cnt", 0) or 0)
+
+        pshare_bb = trf.get("top_partner_share_bb", np.nan)
+        partner_share = float(pshare_bb) if pd.notna(pshare_bb) else float(trf.get("top_partner_share", 0.0) or 0.0)
+
+        ctx = trf.get("pair_ctx", {}) or {}
+        shared = int(ctx.get("shared_sessions", 0) or 0)
+        dir_cons = float(ctx.get("dir_consistency", 0.0) or 0.0)
+        hu_share = float(ctx.get("hu_share", 0.0) or 0.0)
+        one_sided = float(trf.get("one_sidedness", 0.0) or 0.0)
+
+        enough = (shared >= PAIR_MIN_SHARED_SESSIONS_STRONG) or (pair_games_cnt >= PAIR_MIN_PAIR_GAMES_STRONG)
+
+        if label == "RING":
+            # net (BB)
+            if pd.notna(net_bb):
+                abs_net_bb = abs(float(net_bb))
+                if abs_net_bb >= PAIR_NET_CRITICAL_RING_BB:
+                    score += 55
+                    reasons.append(f"GAMES/RING: критичный net-flow {fmt_bb(net_bb)} с партнёром {partner}.")
+                elif abs_net_bb >= PAIR_NET_ALERT_RING_BB and enough:
+                    score += 25
+                    reasons.append(f"GAMES/RING: net-flow {fmt_bb(net_bb)} с партнёром {partner} (enough shared/games).")
+            else:
+                if abs(net_val) >= 120:
+                    score += 45
+                    reasons.append(f"GAMES/RING: net-flow {fmt_money(net_val)} с партнёром {partner} (нет BB, fallback).")
+                elif abs(net_val) >= 60 and enough:
+                    score += 18
+                    reasons.append(f"GAMES/RING: net-flow {fmt_money(net_val)} с партнёром {partner} (fallback).")
+
+            # turnover (gross BB)
+            if pd.notna(gross_bb):
+                gbb = float(gross_bb)
+                if gbb >= PAIR_GROSS_CRITICAL_RING_BB and shared >= 3 and partner_share >= PAIR_PARTNER_SHARE_ALERT:
+                    score += 25
+                    reasons.append(f"GAMES/RING: очень высокий gross {fmt_bb(gross_bb)} с {partner} при доле {fmt_pct(partner_share)}.")
+                elif gbb >= PAIR_GROSS_ALERT_RING_BB and enough and partner_share >= PAIR_PARTNER_SHARE_ALERT:
+                    score += 12
+                    reasons.append(f"GAMES/RING: высокий gross {fmt_bb(gross_bb)} с {partner} при доле {fmt_pct(partner_share)}.")
+
+            # patterns
+            if enough and partner_share >= PAIR_PARTNER_SHARE_ALERT and (one_sided >= PAIR_ONE_SIDED_ALERT or dir_cons >= PAIR_DIR_CONSIST_ALERT or hu_share >= 0.70):
+                score += 12
+                reasons.append(f"GAMES/RING: one-sided/dir/HU паттерн с {partner} (share {fmt_pct(partner_share)}).")
+
+            # add agent/super-agent bonus only if already suspicious
+            if score >= T_APPROVE:
+                bonus, txt = agent_match_bonus(db_df, int(partner), pid)
+                if bonus > 0 and txt:
+                    score += bonus
+                    reasons.append(f"DB: {txt}")
+
+        else:
+            # TOURNAMENT
+            if abs(net_val) >= PAIR_NET_ALERT_TOUR and enough:
+                score += 12
+                reasons.append(f"GAMES/TOUR: net-flow {fmt_money(net_val)} с {partner}.")
+            if gross_val >= PAIR_GROSS_ALERT_TOUR and enough and partner_share >= 0.60:
+                score += 8
+                reasons.append(f"GAMES/TOUR: gross-turnover {fmt_money(gross_val)} с {partner} (share {fmt_pct(partner_share)}).")
+
+    check_flow(trf_ring, "RING")
+    check_flow(trf_tour, "TOURNAMENT")
 
     score = int(max(0, min(100, score)))
     decision = risk_decision(score)
 
     signals = {
-        "score": score,
-        "decision": decision,
         "player_id": pid,
-        "strongest_partner": strongest_partner,
-        "ring_games": ring_games,
-        "cop_ring": cop_ring,
-        "db": {
-            "j_total": j_total,
-            "player_profit": player_profit,
-            "events_delta": events_delta,
-            "week_cnt": week_cnt,
-            "top_week_share": top_week_share,
-        },
+        "coverageringgames": int(coverage.get("ring_games", 0)),
+        "coveragetourgames": int(coverage.get("tour_games", 0)),
+        "coplayringsessions": int(cop_ring.get("sessions_count", 0)),
+        "coplayringunique": int(cop_ring.get("unique_opponents", 0)),
+        "coplayringtop2share": float(cop_ring.get("top2_coplay_share", 0.0) or 0.0),
+        "coplayringhusessions": int(cop_ring.get("hu_sessions", 0)),
+        "coplayringtophupartner": cop_ring.get("top_hu_partner"),
+        "coplayringtophushare": float(cop_ring.get("top_hu_share", 0.0) or 0.0),
+        "ringtoppartner": trf_ring.get("top_net_partner"),
+        "ringnet": float(trf_ring.get("top_net", 0.0) or 0.0),
+        "ringnetbb": trf_ring.get("top_net_bb", np.nan),
+        "ringgross": float(trf_ring.get("top_gross", 0.0) or 0.0),
+        "ringgrossbb": trf_ring.get("top_gross_bb", np.nan),
+        "ringpartnershare": float(trf_ring.get("top_partner_share", 0.0) or 0.0),
+        "ringpartnersharebb": trf_ring.get("top_partner_share_bb", np.nan),
+        "ringpairgamescnt": int(trf_ring.get("top_pair_games_cnt", 0) or 0),
+        "ringonesided": float(trf_ring.get("one_sidedness", 0.0) or 0.0),
+        "ringsharedsessions": int((trf_ring.get("pair_ctx", {}) or {}).get("shared_sessions", 0) or 0),
+        "ringhushare": float((trf_ring.get("pair_ctx", {}) or {}).get("hu_share", 0.0) or 0.0),
+        "ringdircons": float((trf_ring.get("pair_ctx", {}) or {}).get("dir_consistency", 0.0) or 0.0),
+        "ringsharedsessionspreview": trf_ring.get("shared_sessions_preview", []) or [],
+        "dbjtotal": float(db_sum.get("j_total", 0.0) or 0.0),
+        "dbpring": float(db_sum.get("p_ring", 0.0) or 0.0),
+        "dbpmtt": float(db_sum.get("p_mtt", 0.0) or 0.0),
+        "dbeventsdelta": float(db_sum.get("events_delta", 0.0) or 0.0),
+        "dbweeks": int(db_sum.get("weeks_count", 0) or 0),
+        "dbtopweekshare": float(db_sum.get("top_week_share")) if pd.notna(db_sum.get("top_week_share", np.nan)) else np.nan,
     }
-    return score, decision, reasons, signals
 
-def build_security_message(db_sum: dict, by_week: pd.DataFrame, signals: dict, reasons: list[str], period_label: str) -> str:
-    meta = db_sum.get("meta", {}) if db_sum else {}
-    pid = int(signals.get("player_id", 0))
-    decision = signals.get("decision", "")
-    score = int(signals.get("score", 0))
+    manager_text = (
+        "Низкий риск по данным (разрешить вывод)." if decision == "APPROVE"
+        else "Есть подозрительные сигналы (быстрый чек/при сомнениях — СБ)." if decision == "FAST_CHECK"
+        else "Высокий риск (СБ/ручная проверка)."
+    )
+    return score, decision, manager_text, reasons, signals
 
+def build_security_message(pid: int, decision: str, score: int, weeks_mode: str, week_from: int, week_to: int, signals: dict) -> str:
+    period = weeks_mode if weeks_mode != "Период (от‑до)" else f"Период {week_from}–{week_to}"
     msg = []
     msg.append("ANTI-FRAUD CHECK (PPPoker)")
-    msg.append(f"Period: {period_label}")
     msg.append(f"Player ID: {pid}")
     msg.append(f"Decision: {decision} | Risk score: {score}/100")
+    msg.append(f"Period: {period}")
     msg.append("")
-    msg.append(f"Nick: {meta.get('_nick', '')} | IGN: {meta.get('_ign', '')} | Country: {meta.get('_country', '')}")
-    msg.append(f"Agent: {meta.get('_agent', '')} | AgentID: {meta.get('_agent_id', '')}")
+    msg.append("DB:")
+    msg.append(f"- J total: {fmt_money(signals.get('dbjtotal', 0.0))}")
+    msg.append(f"- Ring: {fmt_money(signals.get('dbpring', 0.0))} | MTT: {fmt_money(signals.get('dbpmtt', 0.0))}")
+    msg.append(f"- Events delta: {fmt_money(signals.get('dbeventsdelta', 0.0))}")
+    if pd.notna(signals.get("dbtopweekshare", np.nan)):
+        msg.append(f"- Top week share: {fmt_pct(signals.get('dbtopweekshare', 0.0))}")
     msg.append("")
-
-    msg.append("DB summary:")
-    msg.append(f"- Player profit (Ring+MTT+Jackpot+Equity): {fmt_money(signals['db']['player_profit'])}")
-    msg.append(f"- J total: {fmt_money(signals['db']['j_total'])}")
-    msg.append(f"- Events delta (J - player total): {fmt_money(signals['db']['events_delta'])}")
-    if pd.notna(signals["db"]["top_week_share"]):
-        msg.append(f"- Top week share: {fmt_pct(float(signals['db']['top_week_share']))}")
-
-    msg.append("")
-    msg.append("Games summary:")
-    cr = signals.get("cop_ring", {})
-    msg.append(f"- Ring games in export: {signals.get('ring_games', 0)}")
-    msg.append(f"- Ring sessions: {cr.get('sessions_cnt', 0)} | HU sessions: {cr.get('hu_sessions', 0)} | Top2 co-play share: {fmt_pct(cr.get('top2_share', 0.0))}")
-    if cr.get("top_hu_partner") is not None:
-        msg.append(f"- Top HU partner: {cr.get('top_hu_partner')} | HU share: {fmt_pct(cr.get('top_hu_share', 0.0))}")
-    if signals.get("strongest_partner") is not None:
-        msg.append(f"- Strongest partner by flows: {signals.get('strongest_partner')}")
-
-    msg.append("")
-    msg.append("Reasons (top):")
-    for r in reasons[:25]:
-        msg.append(f"- {r}")
-
-    if by_week is not None and not by_week.empty:
-        msg.append("")
-        msg.append("DB by week (last 8):")
-        tail = by_week.sort_values("_week").tail(8)
-        for _, row in tail.iterrows():
-            w = int(row["_week"])
-            jt = fmt_money(row.get("_j_total", 0.0))
-            pr = fmt_money(row.get("_p_ring", 0.0))
-            pm = fmt_money(row.get("_p_mtt", 0.0))
-            ct = fmt_money(row.get("_club_comm_total", 0.0))
-            msg.append(f"- week {w}: J={jt}, Ring={pr}, MTT={pm}, Comm={ct}")
-
+    msg.append("GAMES (Ring):")
+    msg.append(f"- Ring games: {signals.get('coverageringgames', 0)} | Tour games: {signals.get('coveragetourgames', 0)}")
+    msg.append(f"- HU sessions: {signals.get('coplayringhusessions', 0)} | Top HU partner: {signals.get('coplayringtophupartner', None)} | Top HU share: {fmt_pct(signals.get('coplayringtophushare', 0.0))}")
+    msg.append(f"- Top partner: {signals.get('ringtoppartner', None)}")
+    netbb = signals.get("ringnetbb", np.nan)
+    grossbb = signals.get("ringgrossbb", np.nan)
+    if pd.notna(netbb):
+        msg.append(f"- Net (BB): {fmt_bb(netbb)} | Gross (BB): {fmt_bb(grossbb) if pd.notna(grossbb) else 'NaN'}")
+    else:
+        msg.append(f"- Net: {fmt_money(signals.get('ringnet', 0.0))} | Gross: {fmt_money(signals.get('ringgross', 0.0))}")
+    msg.append(f"- Partner share: {fmt_pct(signals.get('ringpartnershare', 0.0))}")
+    msg.append(f"- Shared sessions: {signals.get('ringsharedsessions', 0)} | HU-share in pair: {fmt_pct(signals.get('ringhushare', 0.0))} | Dir-cons: {fmt_pct(signals.get('ringdircons', 0.0))}")
+    if signals.get("ringsharedsessionspreview"):
+        msg.append("- Shared session ids (preview): " + ", ".join([str(x) for x in signals.get("ringsharedsessionspreview", [])]))
     return "\n".join(msg)
 
-# ============================================================
-# CACHED LOADERS
-# ============================================================
-@st.cache_data(show_spinner=True)
+# =========================
+# Cached loaders
+# =========================
+@st.cache_data(show_spinner=False)
 def cached_load_db_multi(contents: tuple[bytes, ...], names: tuple[str, ...]) -> pd.DataFrame:
     dfs = []
     for c, n in zip(contents, names):
         dfs.append(load_db_any(BytesFile(c, n)))
     if not dfs:
         return pd.DataFrame()
-    df = pd.concat(dfs, ignore_index=True)
-
-    # Убираем дубли по (week, player) оставляя последнюю версию
-    df = df.sort_values(["_week"]).drop_duplicates(subset=["_week", "_player_id"], keep="last").copy()
-    return df
+    return pd.concat(dfs, ignore_index=True)
 
 @st.cache_data(show_spinner=True)
 def cached_games_bundle_multi(contents: tuple[bytes, ...], names: tuple[str, ...]):
@@ -1083,280 +1207,220 @@ def cached_games_bundle_multi(contents: tuple[bytes, ...], names: tuple[str, ...
         part = parse_games_pppoker_export(BytesFile(c, n))
         if not part.empty:
             all_games.append(part)
-
     if not all_games:
         games_df = pd.DataFrame(columns=[
-            "game_id", "game_type", "product", "table_name", "descriptor", "bb",
-            "start_time", "end_time", "player_id", "nick", "ign",
-            "hands", "win_total", "win_vs_opponents", "fee"
+            "game_id", "game_type", "product", "table_name", "descriptor", "bb", "start_time", "end_time",
+            "player_id", "nick", "ign", "hands", "win_total", "win_vs_opponents", "fee"
         ])
     else:
         games_df = pd.concat(all_games, ignore_index=True)
 
     sessions_df = build_sessions_from_games(games_df)
     flows_df = build_pair_flows_fast(games_df)
-    idx = build_indexes(games_df, sessions_df, flows_df)
+    idx = build_games_indexes(games_df, sessions_df, flows_df)
     return games_df, sessions_df, flows_df, idx
 
-# ============================================================
-# UI
-# ============================================================
+# =========================
+# STREAMLIT UI
+# =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
 with st.sidebar:
-    st.subheader("База данных (persist)")
-    st.caption("Можно хранить недельные файлы в кэше сервиса и догружать новые недели тем же форматом.")
+    st.header("Загрузка")
+    st.caption("Файлы сохраняются в кэше сервиса (persist).")
 
-    db_upload = st.file_uploader("Общее (CSV/XLSX) — можно несколько", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
-    games_upload = st.file_uploader("Игры (TXT/CSV export) — можно несколько", type=["txt", "csv"], accept_multiple_files=True)
+    db_up = st.file_uploader("1) Общее (Excel/CSV)", type=["xlsx", "xls", "csv"], key="db_uploader")
+    db_up_extra = st.file_uploader("2) Общее (доп. недели)", type=["xlsx", "xls", "csv"], accept_multiple_files=True, key="db_uploader_extra")
 
-    col1, col2 = st.columns(2, gap="small")
-    with col1:
-        if st.button("Добавить в DB-базу", use_container_width=True):
-            added = registry_add_files(DB_REGISTRY, "db", db_upload or [])
-            st.success(f"Добавлено файлов в DB: {added}")
-            st.cache_data.clear()
-            st.rerun()
+    games_up = st.file_uploader("3) Игры (TXT/CSV export)", type=["txt", "csv"], key="games_uploader")
+    games_up_extra = st.file_uploader("4) Игры (доп. файлы)", type=["txt", "csv"], accept_multiple_files=True, key="games_uploader_extra")
 
-        if st.button("Очистить DB-базу", use_container_width=True):
-            registry_clear(DB_REGISTRY, "db")
-            st.success("DB-база очищена.")
-            st.cache_data.clear()
-            st.rerun()
-
-    with col2:
-        if st.button("Добавить в Games-базу", use_container_width=True):
-            added = registry_add_files(GAMES_REGISTRY, "games", games_upload or [])
-            st.success(f"Добавлено файлов в Games: {added}")
-            st.cache_data.clear()
-            st.rerun()
-
-        if st.button("Очистить Games-базу", use_container_width=True):
-            registry_clear(GAMES_REGISTRY, "games")
-            st.success("Games-база очищена.")
-            st.cache_data.clear()
-            st.rerun()
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Очистить DB", use_container_width=True):
+        cache_clear(DB_KEY)
+        st.rerun()
+    if c2.button("Очистить Games", use_container_width=True):
+        cache_clear(GAMES_KEY)
+        st.rerun()
+    if c3.button("Очистить всё", use_container_width=True):
+        cache_clear(DB_KEY)
+        cache_clear(GAMES_KEY)
+        st.rerun()
 
     st.divider()
-    st.subheader("Период проверки (DB)")
-    week_mode = st.selectbox("Режим", ["ALL", "LAST_N", "RANGE"], index=1)
-    last_n = st.number_input("Последние N недель", min_value=1, max_value=52, value=4, step=1)
-    week_from = st.number_input("Неделя от", min_value=0, max_value=999, value=1, step=1)
-    week_to = st.number_input("Неделя до", min_value=0, max_value=999, value=1, step=1)
+    st.header("Период (DB)")
+    weeksmode = st.selectbox("Режим", ["Все недели", "Последние N недель", "Период (от‑до)"], index=1)
+    lastn = st.number_input("N", min_value=1, value=4, step=1)
+    weekfrom = st.number_input("От недели", value=1, step=1)
+    weekto = st.number_input("До недели", value=1, step=1)
 
-# ---------- load persisted registries ----------
-db_contents, db_names = registry_load_bytes(DB_REGISTRY)
-games_contents, games_names = registry_load_bytes(GAMES_REGISTRY)
+# persist main db/games
+dbfile = resolve_file(DB_KEY, db_up)
+gamesfile = resolve_file(GAMES_KEY, games_up)
 
-# optional: also use current-session uploads without persisting
-if db_upload:
-    for f in db_upload:
+# collect DB files
+db_contents = []
+db_names = []
+if dbfile is not None:
+    db_contents.append(dbfile.getvalue())
+    db_names.append(getattr(dbfile, "name", "db"))
+
+for f in (db_up_extra or []):
+    try:
         db_contents.append(f.getvalue())
-        db_names.append(getattr(f, "name", "db_upload"))
-
-if games_upload:
-    for f in games_upload:
-        games_contents.append(f.getvalue())
-        games_names.append(getattr(f, "name", "games_upload"))
+        db_names.append(getattr(f, "name", "db_extra"))
+    except Exception:
+        pass
 
 if not db_contents:
-    st.info("Загрузите и добавьте в базу файлы 'Общее' (или загрузите в текущую сессию) — без DB проверка невозможна.")
+    st.info("Загрузите файл 'Общее' (DB).")
     st.stop()
 
-dbdf = cached_load_db_multi(tuple(db_contents), tuple(db_names))
+# load DB
+try:
+    dbdf = cached_load_db_multi(tuple(db_contents), tuple(db_names))
+except Exception as e:
+    st.error(f"Ошибка чтения DB: {e}")
+    st.code(traceback.format_exc())
+    st.stop()
+
 if dbdf.empty:
     st.error("DB пустая или не распарсилась.")
     st.stop()
 
+# period filter
 valid_weeks = sorted([int(w) for w in dbdf["_week"].unique().tolist() if int(w) >= 0])
 wmin = min(valid_weeks) if valid_weeks else 0
 wmax = max(valid_weeks) if valid_weeks else 0
+if weeksmode == "Период (от‑до)" and weekfrom == 1 and weekto == 1 and wmax >= wmin:
+    weekfrom, weekto = wmin, wmax
 
-if week_mode == "RANGE" and (week_from == 1 and week_to == 1) and wmax >= wmin:
-    week_from, week_to = wmin, wmax
+dbperiod = apply_weeks_filter(dbdf, weeksmode, int(lastn), int(weekfrom), int(weekto))
 
-db_period = apply_weeks_filter(dbdf, week_mode, int(last_n), int(week_from), int(week_to))
+# collect games files
+games_contents = []
+games_names = []
+if gamesfile is not None:
+    games_contents.append(gamesfile.getvalue())
+    games_names.append(getattr(gamesfile, "name", "games"))
+for f in (games_up_extra or []):
+    try:
+        games_contents.append(f.getvalue())
+        games_names.append(getattr(f, "name", "games_extra"))
+    except Exception:
+        pass
 
-games_loaded = bool(games_contents)
-if games_loaded:
-    games_df, sessions_df, flows_df, idx = cached_games_bundle_multi(tuple(games_contents), tuple(games_names))
+games_df = pd.DataFrame()
+sessions_df = pd.DataFrame()
+flows_df = pd.DataFrame()
+idx = {}
+
+if games_contents:
+    try:
+        games_df, sessions_df, flows_df, idx = cached_games_bundle_multi(tuple(games_contents), tuple(games_names))
+    except Exception as e:
+        st.error(f"Ошибка чтения/парсинга Games: {e}")
+        st.code(traceback.format_exc())
+        st.stop()
 else:
-    games_df = pd.DataFrame()
-    sessions_df = pd.DataFrame()
-    flows_df = pd.DataFrame()
     idx = {
+        "player_game_series": {},
+        "extremes": {},
         "sessions_by_player": {},
         "sessions_n": {},
         "coplay_counter": {},
         "coplay_counter_hu": {},
         "coplay_sessions_cnt": {},
         "coplay_hu_cnt": {},
-        "ring_stats": {},
-        "pair_map": {},
+        "coplay_sh_cnt": {},
+        "in_map": {},
+        "out_map": {},
+        "flow_totals": {},
+        "top_pair": {},
     }
 
-# ---------- header metrics ----------
+# header metrics
 m1, m2, m3, m4 = st.columns(4, gap="small")
 m1.metric("DB rows", f"{len(dbdf)}", border=True)
 m2.metric("Players in DB", f"{dbdf['_player_id'].nunique()}", border=True)
 m3.metric("Games rows", f"{len(games_df)}", border=True)
 m4.metric("Flows pairs", f"{len(flows_df)}", border=True)
 
-if not games_loaded:
-    st.warning("Файл 'Игры' не загружен: детект перелива будет ограничен, решения станут более консервативными (чаще FAST_CHECK).")
-
 st.divider()
 
-period_label = (
-    "ALL" if week_mode == "ALL"
-    else (f"LAST_N={int(last_n)}" if week_mode == "LAST_N"
-          else f"RANGE={int(week_from)}..{int(week_to)}")
-)
-
-@st.cache_data(show_spinner=True)
-def cached_top_risk(db_period_in: pd.DataFrame, idx_in: dict, top_n: int, games_loaded_flag: bool) -> pd.DataFrame:
-    players = sorted([int(x) for x in db_period_in["_player_id"].unique().tolist()])
-    res = []
-    for pid in players:
-        db_sum, _by_week, _meta = db_summary_for_player(db_period_in, pid)
-        if db_sum is None:
-            continue
-        score, decision, reasons, signals = score_player(pid, db_sum, idx_in, games_loaded_flag)
-        res.append({
-            "player_id": int(pid),
-            "score": int(score),
-            "decision": decision,
-            "player_profit": float(signals["db"]["player_profit"]),
-            "events_delta": float(signals["db"]["events_delta"]),
-            "weeks": int(signals["db"]["week_cnt"]),
-            "ring_games": int(signals.get("ring_games", 0) or 0),
-            "ring_sessions": int((signals.get("cop_ring", {}) or {}).get("sessions_cnt", 0)),
-            "ring_hu_sessions": int((signals.get("cop_ring", {}) or {}).get("hu_sessions", 0)),
-            "strongest_partner": signals.get("strongest_partner", None),
-            "top_reason": (reasons[0] if reasons else ""),
-        })
-
-    if not res:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(res)
-    out = out.sort_values(["score", "player_profit"], ascending=[False, False]).head(int(top_n)).copy()
-    return out
-
-tab_check, tab_top, tab_diag = st.tabs(["Проверка по ID", "Топ риск", "Диагностика"])
+tab_check, tab_top = st.tabs(["Проверка ID", "Топ риск"])
 
 with tab_check:
-    left, right = st.columns([1.0, 1.6], gap="large")
+    left, right = st.columns([1.0, 1.8], gap="large")
 
     with left:
-        st.subheader("Проверка игрока")
-        default_id = int(db_period["_player_id"].iloc[0]) if len(db_period) else int(dbdf["_player_id"].iloc[0])
+        st.subheader("Проверка")
+        default_id = int(dbperiod["_player_id"].iloc[0]) if len(dbperiod) else int(dbdf["_player_id"].iloc[0])
         pid = st.number_input("ID игрока", min_value=0, value=int(default_id), step=1)
         run = st.button("Проверить", type="primary", use_container_width=True)
-        st.caption("Решение: APPROVE / FAST_CHECK / MANUAL_REVIEW (в СБ).")
 
     with right:
         if not run:
             st.info("Введите ID и нажмите «Проверить».")
             st.stop()
 
-        db_sum, by_week, meta = db_summary_for_player(db_period, int(pid))
-        if db_sum is None:
-            st.error("Игрок не найден в DB за выбранный период.")
+        try:
+            dbsum, byweek = db_summary_for_player(dbperiod, int(pid))
+            if dbsum is None:
+                st.error("Игрок не найден в DB за выбранный период.")
+                st.stop()
+
+            rings = idx.get("player_game_series", {}).get(("RING", int(pid)))
+            tours = idx.get("player_game_series", {}).get(("TOURNAMENT", int(pid)))
+            coverage = {
+                "ring_games": int(len(rings)) if rings is not None else 0,
+                "tour_games": int(len(tours)) if tours is not None else 0,
+            }
+
+            copring = coplay_features_fast(int(pid), idx, "RING")
+            coptour = coplay_features_fast(int(pid), idx, "TOURNAMENT")
+            trfring = transfer_features_fast(int(pid), idx, "RING")
+            trftour = transfer_features_fast(int(pid), idx, "TOURNAMENT")
+
+            score, decision, manager_text, reasons, signals = score_player_period(
+                dbdf=dbdf,
+                db_sum=dbsum,
+                cop_ring=copring,
+                cop_tour=coptour,
+                trf_ring=trfring,
+                trf_tour=trftour,
+                coverage=coverage,
+            )
+
+        except Exception as e:
+            st.error(f"Ошибка при проверке ID: {e}")
+            st.code(traceback.format_exc())
             st.stop()
 
-        score, decision, reasons, signals = score_player(int(pid), db_sum, idx, games_loaded)
         badge_text, badge_color = decision_badge(decision)
-
-        cA, cB, cC, cD = st.columns([1.4, 1.0, 1.0, 1.0], gap="small")
+        cA, cB, cC = st.columns([1.4, 1.0, 1.0], gap="small")
         cA.metric("Решение", badge_text, border=True)
-        cB.metric("Risk score", f"{score}/100", border=True)
-        cC.metric("Недель в периоде", f"{signals['db']['week_cnt']}", border=True)
-        cD.metric("Ring games", f"{signals.get('ring_games', 0)}", border=True)
+        cB.metric("Risk", f"{score}/100", border=True)
+        cC.metric("DB weeks", f"{signals.get('dbweeks', 0)}", border=True)
 
         if badge_color == "green":
-            st.success("Риск по данным низкий — вывод можно разрешить.")
+            st.success(manager_text)
         elif badge_color == "orange":
-            st.warning("Есть подозрительные сигналы — рекомендован быстрый чек (или СБ при сомнениях).")
+            st.warning(manager_text)
         else:
-            st.error("Высокий риск — отправить в СБ на ручную проверку.")
+            st.error(manager_text)
 
-        st.subheader("Действия менеджера")
-        for a in manager_actions(decision):
-            st.write(f"- {a}")
-
-        st.divider()
-
-        st.subheader("Ключевые цифры (DB)")
-        k1, k2, k3, k4 = st.columns(4, gap="small")
-        k1.metric("Player profit", fmt_money(signals["db"]["player_profit"]), border=True)
-        k2.metric(f"{COL_J_TOTAL} - {COL_PLAYER_WIN_TOTAL}", fmt_money(signals["db"]["events_delta"]), border=True)
-        if pd.notna(signals["db"]["top_week_share"]):
-            k3.metric("Top week share", fmt_pct(float(signals["db"]["top_week_share"])), border=True)
-        else:
-            k3.metric("Top week share", "NaN", border=True)
-        k4.metric("Ring games (export)", f"{signals.get('ring_games', 0)}", border=True)
-
-        st.subheader("DB по неделям")
-        st.dataframe(by_week.sort_values("_week", ascending=False), use_container_width=True, hide_index=True)
-
-        st.divider()
-
-        st.subheader("Партнёры/переводы (Ring)")
-        pairs = idx.get("pair_map", {}).get(("RING", int(pid)), [])
-        if not pairs:
-            st.info("По 'Игры' не найдено парных потоков (flows) для Ring.")
-        else:
-            rows = []
-            for p in pairs[:10]:
-                partner = int(p["partner"])
-                shared = shared_sessions(int(pid), partner, idx, "RING", limit=50)
-                shared_cnt = len(shared)
-
-                net_bb = p.get("net_bb", np.nan)
-                gross_bb = p.get("gross_bb", np.nan)
-
-                pshare = p.get("partner_share_bb", np.nan)
-                if pd.isna(pshare):
-                    pshare = float(p.get("partner_share", 0.0) or 0.0)
-
-                direction = "получает от партнёра" if (pd.notna(net_bb) and float(net_bb) > 0) else "отдаёт партнёру"
-                if pd.isna(net_bb):
-                    direction = "получает от партнёра" if float(p.get("net", 0.0) or 0.0) > 0 else "отдаёт партнёру"
-
-                rows.append({
-                    "partner_id": partner,
-                    "direction": direction,
-                    "net_bb": float(net_bb) if pd.notna(net_bb) else np.nan,
-                    "gross_bb": float(gross_bb) if pd.notna(gross_bb) else np.nan,
-                    "partner_share": float(pshare),
-                    "pair_games_cnt": int(p.get("games_cnt", 0) or 0),
-                    "shared_sessions_cnt": int(shared_cnt),
-                    "shared_sessions_preview": ", ".join(shared[:8]),
-                })
-
-            show = pd.DataFrame(rows)
-            if not show.empty:
-                show["partner_share"] = show["partner_share"].apply(lambda x: f"{x*100:.0f}%")
-                show["net_bb"] = show["net_bb"].apply(lambda x: fmt_bb(x) if pd.notna(x) else "NaN")
-                show["gross_bb"] = show["gross_bb"].apply(lambda x: fmt_bb(x) if pd.notna(x) else "NaN")
-
-            st.dataframe(show, use_container_width=True, hide_index=True)
-
-        st.divider()
-
-        st.subheader("Причины (top)")
-        for r in reasons[:30]:
+        st.subheader("Причины")
+        for r in reasons[:60]:
             st.write(f"- {r}")
 
         st.divider()
-
         st.subheader("Сообщение для СБ")
-        sec_text = build_security_message(db_sum, by_week, signals, reasons, period_label)
-        st.textarea("Скопировать/отправить", value=sec_text, height=260)
+        sec_text = build_security_message(int(pid), decision, int(score), weeksmode, int(weekfrom), int(weekto), signals)
+        st.textarea("Скопировать", value=sec_text, height=260)
         st.download_button(
-            "Скачать .txt для СБ",
+            "Скачать .txt",
             data=sec_text.encode("utf-8"),
             file_name=f"SB_check_{int(pid)}.txt",
             mime="text/plain",
@@ -1364,53 +1428,53 @@ with tab_check:
         )
 
 with tab_top:
-    st.subheader("Топ подозрительных за период")
-    colA, colB = st.columns([1.0, 1.0], gap="small")
-    with colA:
-        top_n = st.number_input("Top N", min_value=10, max_value=300, value=50, step=10)
-    with colB:
-        build = st.button("Построить список", type="primary", use_container_width=True)
+    st.subheader("Топ риск за период (по DB)")
+    topn = st.number_input("Top N", min_value=10, max_value=300, value=50, step=10)
 
-    if not build:
-        st.info("Нажмите «Построить список».")
-        st.stop()
+    @st.cache_data(show_spinner=True)
+    def cached_top_risk(dbperiod_in: pd.DataFrame, idx_in: dict, topn_in: int):
+        players = sorted(dbperiod_in["_player_id"].unique().tolist())
+        res = []
+        for pid in players:
+            dbsum, _ = db_summary_for_player(dbperiod_in, int(pid))
+            if dbsum is None:
+                continue
+            rings = idx_in.get("player_game_series", {}).get(("RING", int(pid)))
+            tours = idx_in.get("player_game_series", {}).get(("TOURNAMENT", int(pid)))
+            coverage = {"ring_games": int(len(rings)) if rings is not None else 0, "tour_games": int(len(tours)) if tours is not None else 0}
+            copring = coplay_features_fast(int(pid), idx_in, "RING")
+            coptour = coplay_features_fast(int(pid), idx_in, "TOURNAMENT")
+            trfring = transfer_features_fast(int(pid), idx_in, "RING")
+            trftour = transfer_features_fast(int(pid), idx_in, "TOURNAMENT")
 
-    topdf = cached_top_risk(db_period, idx, int(top_n), games_loaded)
+            score, decision, _mgr, reasons, signals = score_player_period(
+                dbdf=dbdf,
+                db_sum=dbsum,
+                cop_ring=copring,
+                cop_tour=coptour,
+                trf_ring=trfring,
+                trf_tour=trftour,
+                coverage=coverage,
+            )
+            res.append({
+                "player_id": int(pid),
+                "risk_score": int(score),
+                "decision": decision,
+                "db_total": float(signals.get("dbjtotal", 0.0)),
+                "ring_games": int(signals.get("coverageringgames", 0)),
+                "ring_hu_sessions": int(signals.get("coplayringhusessions", 0)),
+                "top_partner": signals.get("ringtoppartner", None),
+                "top_reason": (reasons[0] if reasons else ""),
+            })
+        out = pd.DataFrame(res)
+        if out.empty:
+            return out
+        return out.sort_values(["risk_score", "db_total"], ascending=[False, False]).head(int(topn_in)).copy()
+
+    topdf = cached_top_risk(dbperiod, idx, int(topn))
     if topdf.empty:
-        st.info("Не удалось построить список (возможно, пустой период).")
-        st.stop()
-
-    st.dataframe(topdf, use_container_width=True, hide_index=True)
-
-    csv_bytes = topdf.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "Скачать CSV",
-        data=csv_bytes,
-        file_name="top_risk_players.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-with tab_diag:
-    st.subheader("Диагностика загрузки")
-    st.write("- DB weeks:", f"{wmin} .. {wmax}")
-    st.write("- Period:", period_label)
-    st.write("- Selected period rows:", len(db_period))
-    st.write("- Games loaded:", bool(games_loaded))
-    if games_loaded:
-        st.write("- Sessions:", len(sessions_df))
-        st.write("- Flows:", len(flows_df))
-
-    st.subheader("Сэмпл ring_stats (первые 5 игроков периода)")
-    sample_players = sorted([int(x) for x in db_period["_player_id"].unique().tolist()])[:5]
-    diag_rows = []
-    for sp in sample_players:
-        rs = idx.get("ring_stats", {}).get(int(sp), {})
-        diag_rows.append({
-            "player_id": int(sp),
-            "ring_games": int(rs.get("ring_games", 0) or 0),
-            "hands": float(rs.get("hands", 0.0) or 0.0),
-            "win_bb": float(rs.get("win_bb", 0.0) or 0.0),
-            "bb_per_100hands": float(rs.get("bb_per_100hands", np.nan)),
-        })
-    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
+        st.info("Пусто.")
+    else:
+        st.dataframe(topdf, use_container_width=True, hide_index=True)
+        csvbytes = topdf.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("Скачать CSV", data=csvbytes, file_name="top_risk.csv", mime="text/csv", use_container_width=True)
